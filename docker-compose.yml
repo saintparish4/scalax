@@ -1,0 +1,63 @@
+services:
+  localstack:
+    image: localstack/localstack
+    ports:
+      - "4566:4566" # LocalStack Gateway 
+      - "4510-4519:4510-4519" # External services port range
+    environment:
+      - SERVICES=dynamodb,kinesis,cloudwatch
+      - DEBUG=1
+      - PERSISTENCE=1 
+      - DOCKER_HOST=unix:///var/run/docker.sock 
+    volumes:
+      - "./localstack-init:/etc/localstack/init/ready.d" 
+      - "localstack-data:/var/lib/localstack" 
+      - "/var/run/docker.sock:/var/run/docker.sock" 
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s 
+      timeout: 5s 
+      retries: 10
+      start_period: 30s 
+    networks:
+      - rate-limiter-network 
+
+  rate-limiter:
+    profiles:
+      - app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8080
+      - AWS_REGION=us-east-1
+      - USE_LOCALSTACK=true
+      - DYNAMODB_ENDPOINT=http://localstack:4566
+      - KINESIS_ENDPOINT=http://localstack:4566
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - RATE_LIMIT_TABLE=rate-limits
+      - IDEMPOTENCY_TABLE=idempotency
+      - KINESIS_STREAM=rate-limit-events
+      - KINESIS_ENABLED=true
+    depends_on:
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    networks:
+      - rate-limiter-network
+
+volumes:
+  localstack-data:
+
+networks:
+  rate-limiter-network:
+    driver: bridge

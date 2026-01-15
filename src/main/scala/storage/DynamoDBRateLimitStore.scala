@@ -77,21 +77,23 @@ class DynamoDBRateLimitStore[F[_]: Async: Logger](
 
       // Step 2: Calculate refilled tokens
       state = currentState.getOrElse(initialState(profile, nowMs))
-      elapsedMs: Long = nowMs - state.lastRefillEpochMs
-      tokensToAdd: Double = elapsedMs / 1000.0 * profile.refillRatePerSecond
-      refilledTokens: Double = math
-        .min(profile.capacity.toDouble, state.tokens + tokensToAdd)
+      elapsedMs = nowMs - state.lastRefillEpochMs
+      tokensToAdd = elapsedMs / 1000.0 * profile.refillRatePerSecond
+      refilledTokens = math.min(profile.capacity.toDouble, state.tokens + tokensToAdd)
+      
+      // Ensure refilledTokens doesn't exceed capacity due to floating point precision
+      clampedRefilledTokens = math.min(profile.capacity.toDouble, math.max(0.0, refilledTokens))
 
       // Calculate reset time (when bucket will be full)
-      tokensToFull: Double = profile.capacity.toDouble - refilledTokens
+      tokensToFull = profile.capacity.toDouble - clampedRefilledTokens
       secondsToFull = (tokensToFull / profile.refillRatePerSecond).ceil.toLong
       resetAt = Instant.ofEpochMilli(nowMs).plusSeconds(secondsToFull)
 
       // Step 3: Decide
       decision <-
-        if refilledTokens >= cost then
+        if clampedRefilledTokens >= cost then
           // Allow: attempt atomic write
-          val newTokens = refilledTokens - cost
+          val newTokens = math.max(0.0, clampedRefilledTokens - cost)
           val newState = TokenBucketState(newTokens, nowMs, state.version + 1)
 
           conditionalPutState(pk, newState, state.version, profile.ttlSeconds)
@@ -120,7 +122,7 @@ class DynamoDBRateLimitStore[F[_]: Async: Logger](
         else
           // Reject: not enough tokens
           val secondsUntilAllowed =
-            ((cost - refilledTokens) / profile.refillRatePerSecond).ceil.toInt
+            ((cost - clampedRefilledTokens) / profile.refillRatePerSecond).ceil.toInt
           Async[F].pure(
             RateLimitDecision.Rejected(math.max(1, secondsUntilAllowed), resetAt),
           )

@@ -1,0 +1,67 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Build artifacts
+target/
+project/target/
+project/project/target/
+dist/
+*.class
+*.jar
+*.log
+
+# IDE
+.idea/
+.vscode/
+.ensime/
+.ensime_cache/
+.metals/
+.bloop/
+.bsp/
+*.iml
+*.ipr
+*.iws
+
+# SBT
+.sbt/
+.history/
+.sbt-scripted/
+local.sbt
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Documentation
+README.md
+*.md
+docs/
+
+# Scripts (not needed in container)
+scripts/
+Makefile
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Test files
+test-output/
+*.log
+
+# LocalStack data
+localstack-data/
+
+# Misc
+*.cache
