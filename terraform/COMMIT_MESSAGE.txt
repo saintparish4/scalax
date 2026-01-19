@@ -1,0 +1,22 @@
+feat: add Terraform infrastructure for rate limiter platform
+
+Infrastructure Components:
+- VPC with public and private subnets across multiple AZs
+- DynamoDB tables for rate limiting and idempotency tracking
+- Kinesis stream for event publishing
+- ECS Fargate cluster with Application Load Balancer
+- CloudWatch dashboards and alarms for monitoring
+
+Module Structure:
+- networking: VPC, subnets, internet gateway, NAT gateway
+- dynamodb: Rate limit and idempotency tables with proper indexes
+- kinesis: Stream configuration with configurable shards and retention
+- ecs: Fargate cluster, service, task definition, ALB, and IAM roles
+
+Features:
+- Modular architecture for maintainability and reusability
+- Environment-specific configurations (dev, prod) via tfvars
+- Comprehensive CloudWatch monitoring with dashboards
+- Alarms for CPU, memory, and error rate thresholds
+- Proper IAM roles and policies for least privilege access
+- Configurable resource sizing and scaling parameters

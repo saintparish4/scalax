@@ -1,6 +1,7 @@
 .PHONY: help start stop logs run test integration status clean \
        docker-build docker-run docker-run-detached docker-stop docker-logs \
-       curl-check curl-status curl-health curl-ready all-tests dev docker-restart
+       curl-check curl-status curl-health curl-ready all-tests dev docker-restart \
+       tf-validate
 
 # Default target
 .DEFAULT_GOAL := help
@@ -32,6 +33,9 @@ help: ## Show this help message
 	@echo "  make curl-status  Test GET /v1/ratelimit/status/:key"
 	@echo "  make curl-health  Test GET /health"
 	@echo "  make curl-ready   Test GET /ready"
+	@echo ""
+	@echo "Terraform:"
+	@echo "  make tf-validate  Validate Terraform configuration"
 
 # =============================================================================
 # Local Development (sbt + LocalStack)
@@ -190,3 +194,19 @@ curl-ready: ## Test GET /ready
 	@echo "Testing readiness endpoint..."
 	@curl -s http://localhost:8080/ready | python3 -m json.tool 2>/dev/null || \
 		echo "Error: Service not available"
+
+# =============================================================================
+# Terraform
+# =============================================================================
+
+tf-validate: ## Validate Terraform configuration
+	@echo "Validating Terraform configuration..."
+	@command -v terraform >/dev/null 2>&1 || { \
+		echo "Error: terraform not found in PATH."; \
+		echo "Install Terraform: https://www.terraform.io/downloads"; \
+		exit 1; \
+	}
+	@echo "Initializing Terraform providers..."
+	cd terraform && terraform init -upgrade
+	@echo "Validating Terraform configuration..."
+	cd terraform && terraform validate
