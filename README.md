@@ -1,6 +1,6 @@
 # Scala Distributed Rate Limiter Platform
 
-A production-grade distributed rate limiting and idempotency platform built with Scala 3 and AWS services.
+A distributed rate limiting and idempotency platform built with Scala 3 and AWS services.
 
 ## Product Vision
 
@@ -10,7 +10,7 @@ This platform provides a scalable, high-performance rate limiting service that e
 - **Stream events** to AWS Kinesis for real-time analytics and monitoring
 - **Scale horizontally** to handle high-throughput workloads with sub-10ms latency
 
-Designed for production use with AWS-native services, the platform offers distributed rate limiting that works seamlessly across multiple service instances while maintaining consistency and performance.
+The platform offers distributed rate limiting that works seamlessly across multiple service instances while maintaining consistency and performance.
 
 ## Prerequisites
 

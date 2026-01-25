@@ -128,19 +128,23 @@ class HttpApiIntegrationSpec
     }
 
     "POST /v1/ratelimit/check should return 429 when over capacity" in {
-      val body = """{"key": "exhaust-key", "cost": 1}"""
-      val request = Request[IO](Method.POST, uri"/v1/ratelimit/check")
-        .withEntity(body)
+      // Exhaust all capacity in a single request to avoid token refill between requests
+      val exhaustBody = """{"key": "exhaust-key", "cost": 10}"""
+      val exhaustRequest = Request[IO](Method.POST, uri"/v1/ratelimit/check")
+        .withEntity(exhaustBody)
+        .putHeaders(headers.`Content-Type`(MediaType.application.json))
+
+      val nextBody = """{"key": "exhaust-key", "cost": 1}"""
+      val nextRequest = Request[IO](Method.POST, uri"/v1/ratelimit/check")
+        .withEntity(nextBody)
         .putHeaders(headers.`Content-Type`(MediaType.application.json))
 
       val test = for {
-        // Exhaust capacity - consume response body to ensure request completes
-        _ <- (1 to 10).toList.traverse_ { _ =>
-          httpApp.run(request).flatMap(_.body.compile.drain)
-        }
+        // Exhaust all capacity in one request
+        _ <- httpApp.run(exhaustRequest).flatMap(_.body.compile.drain)
 
         // This should be rejected
-        response <- httpApp.run(request)
+        response <- httpApp.run(nextRequest)
       } yield response
 
       test.asserting { response =>

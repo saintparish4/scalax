@@ -82,18 +82,21 @@ class DynamoDBRateLimitStore[F[_]: Async: Logger](
       refilledTokens = math.min(profile.capacity.toDouble, state.tokens + tokensToAdd)
       
       // Ensure refilledTokens doesn't exceed capacity due to floating point precision
+      // Also ensure it's not negative and clamp to reasonable precision
       clampedRefilledTokens = math.min(profile.capacity.toDouble, math.max(0.0, refilledTokens))
+      // Round to avoid floating point precision issues that could allow requests when tokens are effectively 0
+      roundedTokens = math.round(clampedRefilledTokens * 1000.0) / 1000.0
 
       // Calculate reset time (when bucket will be full)
-      tokensToFull = profile.capacity.toDouble - clampedRefilledTokens
+      tokensToFull = profile.capacity.toDouble - roundedTokens
       secondsToFull = (tokensToFull / profile.refillRatePerSecond).ceil.toLong
       resetAt = Instant.ofEpochMilli(nowMs).plusSeconds(secondsToFull)
 
       // Step 3: Decide
       decision <-
-        if clampedRefilledTokens >= cost then
+        if roundedTokens >= cost then
           // Allow: attempt atomic write
-          val newTokens = math.max(0.0, clampedRefilledTokens - cost)
+          val newTokens = math.max(0.0, roundedTokens - cost)
           val newState = TokenBucketState(newTokens, nowMs, state.version + 1)
 
           conditionalPutState(pk, newState, state.version, profile.ttlSeconds)
@@ -122,7 +125,7 @@ class DynamoDBRateLimitStore[F[_]: Async: Logger](
         else
           // Reject: not enough tokens
           val secondsUntilAllowed =
-            ((cost - clampedRefilledTokens) / profile.refillRatePerSecond).ceil.toInt
+            ((cost - roundedTokens) / profile.refillRatePerSecond).ceil.toInt
           Async[F].pure(
             RateLimitDecision.Rejected(math.max(1, secondsUntilAllowed), resetAt),
           )
