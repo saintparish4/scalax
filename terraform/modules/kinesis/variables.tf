@@ -19,3 +19,16 @@ variable "retention_hours" {
   type        = number
   default     = 24
 }
+
+# Firehose settings
+variable "firehose_buffer_size" {
+  description = "Buffer size in MB before Firehose delivers to S3 (1-128)"
+  type        = number
+  default     = 5
+}
+
+variable "firehose_buffer_interval" {
+  description = "Buffer interval in seconds before Firehose delivers to S3 (60-900)"
+  type        = number
+  default     = 300
+}
