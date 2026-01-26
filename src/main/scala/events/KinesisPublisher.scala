@@ -1,9 +1,6 @@
 package events
 
-import java.util.concurrent.{CompletableFuture, CompletionStage}
-
 import scala.jdk.CollectionConverters.*
-import scala.jdk.FutureConverters.*
 
 import org.typelevel.log4cats.Logger
 
@@ -27,16 +24,6 @@ class KinesisPublisher[F[_]: Async: Logger](
 
   private val logger = Logger[F]
 
-  private def completionStageToCompletableFuture[T](
-      cs: CompletionStage[T],
-  ): CompletableFuture[T] =
-    val cf = new CompletableFuture[T]()
-    cs.whenComplete((result, throwable) =>
-      if throwable != null then cf.completeExceptionally(throwable)
-      else cf.complete(result),
-    )
-    cf
-
   override def publish(event: RateLimitEvent): F[Unit] =
     if !config.enabled then Async[F].unit
     else
@@ -47,13 +34,14 @@ class KinesisPublisher[F[_]: Async: Logger](
         .partitionKey(event.partitionKey).data(bytes).build()
 
       Async[F].fromCompletableFuture(
-        Async[F].delay(completionStageToCompletableFuture(client.putRecord(request))),
+        Async[F].delay(client.putRecord(request).toCompletableFuture),
       ).void.handleErrorWith(e =>
         logger.warn(e)(s"Failed to publish event: ${event.eventType}"),
       )
 
   override def publishBatch(events: List[RateLimitEvent]): F[Unit] =
     if !config.enabled || events.isEmpty then Async[F].unit
+    else if events.size == 1 then publish(events.head)
     else
       // Kinesis PutRecords supports up to 500 records per call
       val batches = events.grouped(500).toList
@@ -68,7 +56,7 @@ class KinesisPublisher[F[_]: Async: Logger](
           .records(records.asJava).build()
 
         Async[F].fromCompletableFuture(
-          Async[F].delay(completionStageToCompletableFuture(client.putRecords(request))),
+          Async[F].delay(client.putRecords(request).toCompletableFuture),
         ).flatMap(response =>
           // Log if any records failed
           if response.failedRecordCount() > 0 then
@@ -85,5 +73,5 @@ class KinesisPublisher[F[_]: Async: Logger](
       .streamName(config.streamName).build()
 
     Async[F].fromCompletableFuture(
-      Async[F].delay(completionStageToCompletableFuture(client.describeStreamSummary(request))),
+      Async[F].delay(client.describeStreamSummary(request).toCompletableFuture),
     ).map(_ => true).handleError(_ => false)

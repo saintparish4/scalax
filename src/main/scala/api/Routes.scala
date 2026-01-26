@@ -1,57 +1,66 @@
 package com.ratelimiter.api
 
+import java.time.Instant
+
 import org.http4s.*
+import org.http4s.circe.*
+import org.http4s.circe.CirceEntityDecoder.*
 import org.http4s.circe.CirceEntityEncoder.*
 import org.http4s.dsl.Http4sDsl
-import org.http4s.server.middleware.{Logger as Http4sLogger, RequestId}
+import org.http4s.server.{AuthMiddleware, AuthedRoutes, Router}
 import org.typelevel.log4cats.Logger
 
-import config.{AppConfig, RateLimitConfig}
-import core.{IdempotencyStore, RateLimitStore}
-import events.EventPublisher
-import cats.effect.Async
+import cats.effect.*
 import cats.syntax.all.*
 import io.circe.generic.auto.*
 import io.circe.syntax.*
+import core.*
+import events.*
+import metrics.*
+import security.*
+import config.RateLimitConfig
 
-// --- Health check responses ---
-
-case class HealthResponse(status: String, version: String)
-
-case class ReadyResponse(status: String, checks: Map[String, Boolean])
-
-/** Aggregates all API routes and applies middleware.
+/** HTTP routes for the rate limiter API.
+  *
+  * Provides endpoints for:
+  *   - Rate limit checks
+  *   - Idempotency checks
+  *   - Health and readiness probes
+  *   - Metrics (admin only)
   */
-class Routes[F[_]: Async: Logger](
+class Routes[F[_]: Async](
     rateLimitStore: RateLimitStore[F],
     idempotencyStore: IdempotencyStore[F],
     eventPublisher: EventPublisher[F],
-    config: AppConfig,
+    metricsPublisher: MetricsPublisher[F],
+    authMiddleware: AuthMiddleware[F, AuthenticatedClient],
+    rateLimitConfig: RateLimitConfig,
+    logger: Logger[F],
 ) extends Http4sDsl[F]:
 
-  private val logger = Logger[F]
-
-  private val rateLimitApi =
-    new RateLimitApi[F](rateLimitStore, eventPublisher, config.rateLimit)
-
-  private val idempotencyApi = new IdempotencyApi[F](
-    idempotencyStore,
+  private val rateLimitApi = RateLimitApi[F](
+    rateLimitStore,
     eventPublisher,
-    config.rateLimit.defaultTtlSeconds,
+    metricsPublisher,
+    rateLimitConfig,
+    logger,
   )
 
-  private val healthRoutes: HttpRoutes[F] = HttpRoutes.of[F] {
+  private val idempotencyApi =
+    IdempotencyApi[F](idempotencyStore, eventPublisher, metricsPublisher, logger)
 
+  // Public routes (no auth required)
+  private val publicRoutes: HttpRoutes[F] = HttpRoutes.of[F] {
     // Liveness probe - always returns 200 if service is running
     case GET -> Root / "health" =>
-      Ok(HealthResponse(status = "healthy", version = "0.1.0").asJson)
+      Ok(HealthResponse("healthy", BuildInfo.version).asJson)
 
     // Readiness probe - checks dependencies
     case GET -> Root / "ready" =>
       for
-        dynamoOk <- rateLimitStore.healthCheck
-        kinesisOk <- eventPublisher.healthCheck
-        idempotencyOk <- idempotencyStore.healthCheck
+        dynamoOk <- rateLimitStore.healthCheck.handleError(_ => false)
+        kinesisOk <- eventPublisher.healthCheck.handleError(_ => false)
+        idempotencyOk <- idempotencyStore.healthCheck.handleError(_ => false)
 
         checks = Map(
           "dynamodb_ratelimit" -> dynamoOk,
@@ -62,24 +71,58 @@ class Routes[F[_]: Async: Logger](
         allHealthy = checks.values.forall(identity)
 
         response <-
-          if allHealthy then
-            Ok(ReadyResponse(status = "ready", checks = checks).asJson)
-          else
-            ServiceUnavailable(
-              ReadyResponse(status = "not ready", checks = checks).asJson,
-            )
+          if allHealthy then Ok(ReadyResponse("ready", checks).asJson)
+          else ServiceUnavailable(ReadyResponse("not ready", checks).asJson)
       yield response
   }
 
-  // Combine all routes
-  private val allRoutes: HttpRoutes[F] = healthRoutes <+>
-    rateLimitApi.routes <+> idempotencyApi.routes
+  // Authenticated routes
+  private val authedRoutes: AuthedRoutes[AuthenticatedClient, F] = AuthedRoutes
+    .of {
+      // Rate limit check
+      case req @ POST -> Root / "v1" / "ratelimit" / "check" as client =>
+        rateLimitApi.check(req.req, client)
 
-  // Apply middleware
-  val httpApp: HttpApp[F] =
-    // Log requests/responses in debug mode
-    Http4sLogger.httpApp(
-      logHeaders = true,
-      logBody = false,
-      logAction = Some((msg: String) => logger.debug(msg)),
-    )(allRoutes.orNotFound)
+      // Rate limit status
+      case GET -> Root / "v1" / "ratelimit" / "status" / key as client =>
+        rateLimitApi.status(key, client)
+
+      // Idempotency check
+      case req @ POST -> Root / "v1" / "idempotency" / "check" as client =>
+        idempotencyApi.check(req.req, client)
+
+      // Store idempotency response
+      case req @ POST -> Root / "v1" / "idempotency" / key / "complete" as
+          client => idempotencyApi.complete(key, req.req, client)
+    }
+
+  // Combined routes
+  val routes: HttpRoutes[F] = publicRoutes <+> authMiddleware(authedRoutes)
+
+  def httpApp: HttpApp[F] = Router("/" -> routes).orNotFound
+
+// API models
+case class HealthResponse(status: String, version: String)
+case class ReadyResponse(status: String, checks: Map[String, Boolean])
+
+object BuildInfo:
+  val version = "0.2.0"
+
+object Routes:
+  def apply[F[_]: Async](
+      rateLimitStore: RateLimitStore[F],
+      idempotencyStore: IdempotencyStore[F],
+      eventPublisher: EventPublisher[F],
+      metricsPublisher: MetricsPublisher[F],
+      authMiddleware: AuthMiddleware[F, AuthenticatedClient],
+      rateLimitConfig: RateLimitConfig,
+      logger: Logger[F],
+  ): Routes[F] = new Routes[F](
+    rateLimitStore,
+    idempotencyStore,
+    eventPublisher,
+    metricsPublisher,
+    authMiddleware,
+    rateLimitConfig,
+    logger,
+  )

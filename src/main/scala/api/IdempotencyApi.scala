@@ -1,101 +1,219 @@
-package com.ratelimiter.api
+package api
+
+import java.time.Instant
 
 import org.http4s.*
 import org.http4s.circe.*
+import org.http4s.circe.CirceEntityDecoder.*
 import org.http4s.circe.CirceEntityEncoder.*
 import org.http4s.dsl.Http4sDsl
-import org.typelevel.ci.*
 import org.typelevel.log4cats.Logger
 
-import core.{CachedResponse, IdempotencyResult, IdempotencyStore}
-import events.{EventPublisher, RateLimitEvent}
-import cats.effect.{Async, Clock, Spawn}
-import cats.effect.syntax.spawn.*
+import cats.effect.*
 import cats.syntax.all.*
 import io.circe.generic.auto.*
 import io.circe.syntax.*
+import core.*
+import events.*
+import metrics.*
+import security.*
 
-// --- Request/Response DTOs ---
-
-case class IdempotencyCheckRequest(idempotencyKey: String, ttl: Option[Long])
-
-case class IdempotencyCheckResponse(
-    status: String, // "new" or "duplicate"
-    idempotencyKey: String,
-    originalResponse: Option[CachedResponse],
-)
-
-case class IdempotencyStoreRequest(
-    idempotencyKey: String,
-    response: CachedResponse,
-)
-
-/** HTTP API for idempotency operations.
+/** Idempotency API endpoints.
   *
-  * Endpoints: POST /v1/idempotency/check - Check if operation is new or
-  * duplicate POST /v1/idempotency/store - Store response for completed
-  * operation
+  * Provides first-writer-wins idempotency for distributed operations.
   */
-class IdempotencyApi[F[_]: Async: Spawn: Logger](
+class IdempotencyApi[F[_]: Async](
     store: IdempotencyStore[F],
     eventPublisher: EventPublisher[F],
-    defaultTtlSeconds: Long = 86400, // 24 hours
+    metricsPublisher: MetricsPublisher[F],
+    logger: Logger[F],
 ) extends Http4sDsl[F]:
 
-  private val logger = Logger[F]
+  private val DefaultTtlSeconds = 86400L // 24 hours
 
-  given EntityDecoder[F, IdempotencyCheckRequest] =
-    jsonOf[F, IdempotencyCheckRequest]
-  given EntityDecoder[F, IdempotencyStoreRequest] =
-    jsonOf[F, IdempotencyStoreRequest]
+  /** POST /v1/idempotency/check
+    *
+    * Check if an operation with this idempotency key has been processed before.
+    */
+  def check(request: Request[F], client: AuthenticatedClient): F[Response[F]] =
+    for
+      startTime <- Clock[F].realTime.map(_.toMillis)
+      checkReq <- request.as[IdempotencyCheckRequest]
 
-  val routes: HttpRoutes[F] = HttpRoutes.of[F] {
+      // Perform idempotency check
+      _ <- logger.debug(s"Idempotency check: key=${checkReq
+          .idempotencyKey}, client=${client.apiKeyId}")
+      result <- store.check(
+        checkReq.idempotencyKey,
+        client.apiKeyId,
+        checkReq.ttl.getOrElse(DefaultTtlSeconds),
+      )
 
-    case req @ POST -> Root / "v1" / "idempotency" / "check" =>
-      for
-        checkReq <- req.as[IdempotencyCheckRequest]
-        ttl = checkReq.ttl.getOrElse(defaultTtlSeconds)
+      // Record metrics
+      latency <- Clock[F].realTime.map(_.toMillis - startTime)
+      _ <- metricsPublisher.recordLatency("idempotency_check", latency.toDouble)
 
-        // Extract API key for events
-        apiKey = req.headers.get(ci"Authorization")
-          .map(_.head.value.stripPrefix("Bearer ").trim).getOrElse("anonymous")
+      // Publish event (fire and forget)
+      now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
+      _ <- publishEvent(
+        result,
+        client,
+        checkReq.ttl.getOrElse(DefaultTtlSeconds),
+        now,
+      ).start
 
-        _ <- logger.debug(s"Idempotency check: key=${checkReq.idempotencyKey}")
-        result <- store.checkOrCreate(checkReq.idempotencyKey, ttl)
+      // Build response
+      response <- buildCheckResponse(result)
+    yield response
 
-        // Publish event for duplicates
-        _ <- result match
-          case IdempotencyResult.Duplicate(key, _) =>
-            for
-              nowMs <- Clock[F].realTime.map(_.toMillis)
-              event = RateLimitEvent.IdempotencyHit(nowMs, apiKey, key)
-              _ <- eventPublisher.publish(event).start
-            yield ()
-          case _ => Async[F].unit
+  /** POST /v1/idempotency/:key/complete
+    *
+    * Store the response for a completed idempotent operation.
+    */
+  def complete(
+      key: String,
+      request: Request[F],
+      client: AuthenticatedClient,
+  ): F[Response[F]] =
+    for
+      completeReq <- request.as[IdempotencyCompleteRequest]
+      now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
 
-        response <- result match
-          case IdempotencyResult.New(key) => Ok(
-              IdempotencyCheckResponse(
-                status = "new",
-                idempotencyKey = key,
-                originalResponse = None,
-              ).asJson,
-            )
+      storedResponse = StoredResponse(
+        statusCode = completeReq.statusCode,
+        body = completeReq.body,
+        headers = completeReq.headers.getOrElse(Map.empty),
+        completedAt = now,
+      )
 
-          case IdempotencyResult.Duplicate(key, cachedResponse) => Ok(
-              IdempotencyCheckResponse(
-                status = "duplicate",
-                idempotencyKey = key,
-                originalResponse = cachedResponse,
-              ).asJson,
-            )
-      yield response
+      _ <- logger
+        .debug(s"Completing idempotency key: $key, client=${client.apiKeyId}")
+      success <- store.storeResponse(key, storedResponse)
 
-    case req @ POST -> Root / "v1" / "idempotency" / "store" =>
-      for
-        storeReq <- req.as[IdempotencyStoreRequest]
-        _ <- logger.debug(s"Storing response for key=${storeReq.idempotencyKey}")
-        _ <- store.storeResponse(storeReq.idempotencyKey, storeReq.response)
-        response <- NoContent()
-      yield response
-  }
+      response <-
+        if success then
+          Ok(
+            IdempotencyCompleteResponse(
+              idempotencyKey = key,
+              status = "completed",
+            ).asJson,
+          )
+        else
+          Conflict(
+            IdempotencyCompleteResponse(
+              idempotencyKey = key,
+              status = "failed",
+              message = Some(
+                "Could not store response - key may not exist or is not pending",
+              ),
+            ).asJson,
+          )
+    yield response
+
+  private def buildCheckResponse(result: IdempotencyResult): F[Response[F]] =
+    result match
+      case IdempotencyResult.New(key, _) => Ok(
+          IdempotencyCheckResponse(
+            status = "new",
+            idempotencyKey = key,
+            originalResponse = None,
+          ).asJson,
+        )
+
+      case IdempotencyResult.Duplicate(key, response, firstSeenAt) => Ok(
+          IdempotencyCheckResponse(
+            status = "duplicate",
+            idempotencyKey = key,
+            originalResponse = response.map(r =>
+              OriginalResponse(
+                statusCode = r.statusCode,
+                body = r.body,
+                headers = r.headers,
+              ),
+            ),
+            firstSeenAt = Some(firstSeenAt.toString),
+          ).asJson,
+        )
+
+      case IdempotencyResult.InProgress(key, startedAt) => Accepted(
+          IdempotencyCheckResponse(
+            status = "in_progress",
+            idempotencyKey = key,
+            originalResponse = None,
+            firstSeenAt = Some(startedAt.toString),
+            message = Some("Operation is currently being processed"),
+          ).asJson,
+        )
+
+  private def publishEvent(
+      result: IdempotencyResult,
+      client: AuthenticatedClient,
+      ttlSeconds: Long,
+      timestamp: Instant,
+  ): F[Unit] =
+    val event = result match
+      case IdempotencyResult.New(key, _) => RateLimitEvent.IdempotencyNew(
+          timestamp = timestamp.toEpochMilli,
+          idempotencyKey = key,
+          clientId = client.apiKeyId,
+          ttlSeconds = ttlSeconds,
+        )
+      case IdempotencyResult.Duplicate(key, _, firstSeenAt) => RateLimitEvent
+          .IdempotencyHit(
+            timestamp = timestamp.toEpochMilli,
+            idempotencyKey = key,
+            clientId = client.apiKeyId,
+            originalRequestTime = firstSeenAt,
+          )
+      case IdempotencyResult.InProgress(key, startedAt) => RateLimitEvent
+          .IdempotencyHit(
+            timestamp = timestamp.toEpochMilli,
+            idempotencyKey = key,
+            clientId = client.apiKeyId,
+            originalRequestTime = startedAt,
+          )
+
+    eventPublisher.publish(event).handleError(error =>
+      logger.warn(s"Failed to publish idempotency event: ${error.getMessage}"),
+    )
+
+// Request/Response models
+case class IdempotencyCheckRequest(
+    idempotencyKey: String,
+    ttl: Option[Long] = None,
+)
+
+case class IdempotencyCheckResponse(
+    status: String,
+    idempotencyKey: String,
+    originalResponse: Option[OriginalResponse] = None,
+    firstSeenAt: Option[String] = None,
+    message: Option[String] = None,
+)
+
+case class OriginalResponse(
+    statusCode: Int,
+    body: String,
+    headers: Map[String, String],
+)
+
+case class IdempotencyCompleteRequest(
+    statusCode: Int,
+    body: String,
+    headers: Option[Map[String, String]] = None,
+)
+
+case class IdempotencyCompleteResponse(
+    idempotencyKey: String,
+    status: String,
+    message: Option[String] = None,
+)
+
+object IdempotencyApi:
+  def apply[F[_]: Async](
+      store: IdempotencyStore[F],
+      eventPublisher: EventPublisher[F],
+      metricsPublisher: MetricsPublisher[F],
+      logger: Logger[F],
+  ): IdempotencyApi[F] =
+    new IdempotencyApi[F](store, eventPublisher, metricsPublisher, logger)

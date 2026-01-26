@@ -1,17 +1,15 @@
 package metrics
 
-import java.time.Instant
-
+import cats.effect.*
+import cats.syntax.all.*
+import org.typelevel.log4cats.Logger
+import software.amazon.awssdk.services.cloudwatch.CloudWatchAsyncClient
+import software.amazon.awssdk.services.cloudwatch.model.*
 import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
 import scala.jdk.FutureConverters.*
+import java.time.Instant
 
-import org.typelevel.log4cats.Logger
-
-import cats.effect.*
-import cats.syntax.all.*
-import software.amazon.awssdk.services.cloudwatch.CloudWatchAsyncClient
-import software.amazon.awssdk.services.cloudwatch.model.*
 
 /** Production-grade metrics publisher for CloudWatch.
   *
@@ -86,7 +84,7 @@ trait MetricsPublisher[F[_]]:
   def recordRateLimitDecision(
       allowed: Boolean,
       clientId: String,
-      tier: String,
+      tier: String = "unknown",
   ): F[Unit]
 
   /** Record circuit breaker state change */
@@ -99,13 +97,17 @@ trait MetricsPublisher[F[_]]:
   /** Record cache metrics */
   def recordCacheMetrics(cacheName: String, hitRate: Double, size: Long): F[Unit]
 
+  /** Record degraded mode operation */
+  def recordDegradedOperation(operation: String): F[Unit]
+
   /** Flush pending metrics */
   def flush: F[Unit]
 
 object MetricsPublisher:
 
-  /** Create a CloudWatch metrics publisher.
-    */
+  /**
+   * Create a CloudWatch metrics publisher with explicit client.
+   */
   def cloudWatch[F[_]: Async: Logger](
       client: CloudWatchAsyncClient,
       config: MetricsConfig,
@@ -126,10 +128,34 @@ object MetricsPublisher:
       bufferRef,
       lastFlushRef,
     )
+  
+  /**
+   * Create a CloudWatch metrics publisher with default client.
+   * Creates and manages the CloudWatch client internally.
+   */
+  def cloudWatch[F[_]: Async: Logger](
+      region: String,
+      namespace: String
+  ): Resource[F, MetricsPublisher[F]] =
+    import software.amazon.awssdk.regions.Region
+    import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider
+    
+    val clientResource = Resource.make(
+      Async[F].delay {
+        CloudWatchAsyncClient.builder()
+          .region(Region.of(region))
+          .credentialsProvider(DefaultCredentialsProvider.create())
+          .build()
+      }
+    )(client => Async[F].delay(client.close()))
+    
+    clientResource.flatMap { client =>
+      cloudWatch(client, MetricsConfig(namespace = namespace))
+    }
 
   /** Create a no-op metrics publisher (for testing).
     */
-  def noop[F[_]: Async]: F[MetricsPublisher[F]] = Async[F].pure {
+  def noop[F[_]: Async]: MetricsPublisher[F] =
     new MetricsPublisher[F]:
       override def increment(
           name: String,
@@ -163,8 +189,8 @@ object MetricsPublisher:
           hitRate: Double,
           size: Long,
       ): F[Unit] = Async[F].unit
+      override def recordDegradedOperation(operation: String): F[Unit] = Async[F].unit
       override def flush: F[Unit] = Async[F].unit
-  }
 
   private def flushLoop[F[_]: Async: Logger](
       bufferRef: Ref[F, List[MetricDataPoint]],
@@ -300,6 +326,9 @@ private class CloudWatchMetricsPublisher[F[_]: Async: Logger](
     val dims = Map("CacheName" -> cacheName)
     gauge("CacheHitRate", hitRate * 100, dims) *> // Percentage
       gauge("CacheSize", size.toDouble, dims)
+  
+  override def recordDegradedOperation(operation: String): F[Unit] =
+    increment("DegradedOperation", Map("Operation" -> operation))
 
   override def flush: F[Unit] = MetricsPublisher
     .doFlush(bufferRef, lastFlushRef, client, config, logger)
@@ -375,6 +404,9 @@ object LoggingMetrics:
         ): F[Unit] = logger
           .info(s"METRIC: Cache name=$cacheName hitRate=${hitRate *
               100}% size=$size")
+        
+        override def recordDegradedOperation(operation: String): F[Unit] =
+          logger.warn(s"METRIC: DegradedOperation operation=$operation")
 
         override def flush: F[Unit] = Async[F].unit
 

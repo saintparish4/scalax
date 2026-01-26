@@ -1,32 +1,176 @@
-package com.ratelimiter.api
+package api 
 
-import java.time.Instant
-
-import scala.concurrent.duration.*
-
+import cats.effect.*
+import cats.syntax.all.*
 import org.http4s.*
+import org.http4s.dsl.Http4sDsl
 import org.http4s.circe.*
 import org.http4s.circe.CirceEntityEncoder.*
-import org.http4s.dsl.Http4sDsl
-import org.http4s.headers.`Retry-After`
-import org.typelevel.ci.*
-import org.typelevel.log4cats.Logger
-
-import config.RateLimitConfig
-import core.{RateLimitDecision, RateLimitProfile, RateLimitStore}
-import events.{EventPublisher, RateLimitEvent}
-import cats.effect.{Async, Clock, Spawn}
-import cats.effect.syntax.spawn.*
-import cats.syntax.all.*
+import org.http4s.circe.CirceEntityDecoder.*
 import io.circe.generic.auto.*
 import io.circe.syntax.*
+import org.typelevel.ci.*
+import org.typelevel.log4cats.Logger
+import java.time.Instant
 
-// --- Request/Response DTOs ---
+import core.*
+import events.*
+import metrics.*
+import security.*
+import config.RateLimitConfig 
 
+/**
+ * Rate limit API endpoints.
+ */
+class RateLimitApi[F[_]: Async](
+    store: RateLimitStore[F],
+    eventPublisher: EventPublisher[F],
+    metricsPublisher: MetricsPublisher[F],
+    config: RateLimitConfig,
+    logger: Logger[F]
+) extends Http4sDsl[F]:
+
+  /**
+   * POST /v1/ratelimit/check
+   * 
+   * Check if a request is allowed under the rate limit.
+   */
+  def check(request: Request[F], client: AuthenticatedClient): F[Response[F]] =
+    for
+      startTime <- Clock[F].realTime.map(_.toMillis)
+      checkReq <- request.as[RateLimitCheckRequest]
+      
+      // Get profile for this client tier
+      profile = getProfile(client.tier, checkReq.profile)
+      
+      // Perform rate limit check
+      _ <- logger.debug(s"Rate limit check: key=${checkReq.key}, cost=${checkReq.cost}, tier=${client.tier}")
+      decision <- store.checkAndConsume(checkReq.key, checkReq.cost, profile)
+      
+      // Record metrics
+      latency <- Clock[F].realTime.map(_.toMillis - startTime)
+      _ <- metricsPublisher.recordLatency("rate_limit_check", latency.toDouble)
+      _ <- decision match
+        case RateLimitDecision.Allowed(_, _) =>
+          metricsPublisher.recordRateLimitDecision(allowed = true, client.apiKeyId)
+        case RateLimitDecision.Rejected(_, _) =>
+          metricsPublisher.recordRateLimitDecision(allowed = false, client.apiKeyId)
+      
+      // Publish event (fire and forget)
+      now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
+      _ <- publishEvent(decision, checkReq, client, now).start
+      
+      // Build response
+      response <- buildCheckResponse(decision, profile)
+    yield response
+
+  /**
+   * GET /v1/ratelimit/status/:key
+   * 
+   * Get current rate limit status for a key.
+   */
+  def status(key: String, client: AuthenticatedClient): F[Response[F]] =
+    for
+      profile = getProfile(client.tier, None)
+      maybeStatus <- store.getStatus(key, profile)
+      response <- maybeStatus match
+        case Some(state) =>
+          // Calculate reset time based on current state
+          nowMs <- Clock[F].realTime.map(_.toMillis)
+          val resetAt = Instant.ofEpochMilli(nowMs).plusSeconds(
+            ((profile.capacity - state.tokens) / profile.refillRatePerSecond).ceil.toLong
+          )
+          Ok(RateLimitStatusResponse(
+            key = key,
+            tokensRemaining = state.tokensInt,
+            limit = profile.capacity,
+            resetAt = resetAt.toString
+          ).asJson)
+        case None =>
+          // No state means full capacity (never seen this key)
+          Ok(RateLimitStatusResponse(
+            key = key,
+            tokensRemaining = profile.capacity,
+            limit = profile.capacity,
+            resetAt = Instant.now().plusSeconds(60).toString
+          ).asJson)
+    yield response
+
+  private def getProfile(tier: ClientTier, profileName: Option[String]): RateLimitProfile =
+    profileName
+      .flatMap(config.profiles.get)
+      .map(p => RateLimitProfile(p.capacity, p.refillRatePerSecond, p.ttlSeconds))
+      .getOrElse(
+        tier match
+          case ClientTier.Free => RateLimitProfile(10, 1.0, 3600)
+          case ClientTier.Basic => RateLimitProfile(100, 10.0, 3600)
+          case ClientTier.Premium => RateLimitProfile(1000, 100.0, 3600)
+          case ClientTier.Enterprise => RateLimitProfile(10000, 1000.0, 3600)
+      )
+
+  private def buildCheckResponse(
+      decision: RateLimitDecision,
+      profile: RateLimitProfile
+  ): F[Response[F]] =
+    decision match
+      case RateLimitDecision.Allowed(tokensRemaining, resetAt) =>
+        Ok(RateLimitCheckResponse(
+          allowed = true,
+          tokensRemaining = Some(tokensRemaining),
+          retryAfter = None,
+          limit = profile.capacity,
+          resetAt = resetAt.toString,
+          message = None
+        ).asJson)
+      
+      case RateLimitDecision.Rejected(retryAfter, resetAt) =>
+        TooManyRequests(RateLimitCheckResponse(
+          allowed = false,
+          tokensRemaining = None,
+          retryAfter = Some(retryAfter),
+          limit = profile.capacity,
+          resetAt = resetAt.toString,
+          message = Some("Rate limit exceeded")
+        ).asJson).map(_.putHeaders(
+          Header.Raw(ci"Retry-After", retryAfter.toString)
+        ))
+
+  private def publishEvent(
+      decision: RateLimitDecision,
+      request: RateLimitCheckRequest,
+      client: AuthenticatedClient,
+      timestamp: Instant
+  ): F[Unit] =
+    val event = decision match
+      case RateLimitDecision.Allowed(tokensRemaining, _) =>
+        RateLimitEvent.Allowed(
+          timestamp = timestamp.toEpochMilli,
+          apiKey = client.apiKeyId,
+          requestKey = request.key,
+          endpoint = request.endpoint,
+          tokensRemaining = tokensRemaining,
+          cost = request.cost,
+        )
+      case RateLimitDecision.Rejected(retryAfter, _) =>
+        RateLimitEvent.Rejected(
+          timestamp = timestamp.toEpochMilli,
+          apiKey = client.apiKeyId,
+          requestKey = request.key,
+          endpoint = request.endpoint,
+          retryAfterSeconds = retryAfter,
+          reason = "Rate limit exceeded",
+        )
+    
+    eventPublisher.publish(event).handleError { error =>
+      logger.warn(s"Failed to publish rate limit event: ${error.getMessage}")
+    }
+
+// Request/Response models
 case class RateLimitCheckRequest(
     key: String,
-    cost: Option[Int],
-    algorithm: Option[String],
+    cost: Int = 1,
+    profile: Option[String] = None,
+    endpoint: Option[String] = None
 )
 
 case class RateLimitCheckResponse(
@@ -35,136 +179,22 @@ case class RateLimitCheckResponse(
     retryAfter: Option[Int],
     limit: Int,
     resetAt: String,
-    message: Option[String],
+    message: Option[String] = None
 )
 
 case class RateLimitStatusResponse(
     key: String,
     tokensRemaining: Int,
     limit: Int,
-    resetAt: String,
+    resetAt: String
 )
 
-/** HTTP API for rate limiting operations.
-  *
-  * Endpoints: POST /v1/ratelimit/check - Check and consume rate limit GET
-  * /v1/ratelimit/status/:key - Get current status for a key
-  */
-class RateLimitApi[F[_]: Async: Spawn: Logger](
-    store: RateLimitStore[F],
-    eventPublisher: EventPublisher[F],
-    config: RateLimitConfig,
-) extends Http4sDsl[F]:
-
-  private val logger = Logger[F]
-
-  private val defaultProfile = RateLimitProfile(
-    capacity = config.defaultCapacity,
-    refillRatePerSecond = config.defaultRefillRatePerSecond,
-    ttlSeconds = config.defaultTtlSeconds,
-  )
-
-  given EntityDecoder[F, RateLimitCheckRequest] =
-    jsonOf[F, RateLimitCheckRequest]
-
-  val routes: HttpRoutes[F] = HttpRoutes.of[F] {
-
-    case req @ POST -> Root / "v1" / "ratelimit" / "check" =>
-      for
-        // Parse request
-        checkReq <- req.as[RateLimitCheckRequest]
-        cost = checkReq.cost.getOrElse(1)
-
-        // Get current timestamp for event
-        nowMs <- Clock[F].realTime.map(_.toMillis)
-
-        // Extract API key from header (for events) - default to "anonymous"
-        apiKey = req.headers.get(ci"Authorization")
-          .map(_.head.value.stripPrefix("Bearer ").trim).getOrElse("anonymous")
-
-        // Perform rate limit check
-        _ <- logger.debug(s"Rate limit check: key=${checkReq.key}, cost=$cost")
-        decision <- store.checkAndConsume(checkReq.key, cost, defaultProfile)
-
-        // Publish event (fire and forget)
-        event = decision match
-          case RateLimitDecision.Allowed(remaining, _) => RateLimitEvent.Allowed(
-              timestamp = nowMs,
-              apiKey = apiKey,
-              requestKey = checkReq.key,
-              endpoint = None,
-              tokensRemaining = remaining,
-              cost = cost,
-            )
-          case RateLimitDecision.Rejected(retryAfter, _) => RateLimitEvent
-              .Rejected(
-                timestamp = nowMs,
-                apiKey = apiKey,
-                requestKey = checkReq.key,
-                endpoint = None,
-                retryAfterSeconds = retryAfter,
-                reason = "rate_limit_exceeded",
-              )
-        _ <- eventPublisher.publish(event).start // Fire and forget
-
-        // Build response
-        response <- decision match
-          case RateLimitDecision.Allowed(remaining, resetAt) => Ok(
-              RateLimitCheckResponse(
-                allowed = true,
-                tokensRemaining = Some(remaining),
-                retryAfter = None,
-                limit = defaultProfile.capacity,
-                resetAt = resetAt.toString,
-                message = None,
-              ).asJson,
-            )
-
-          case RateLimitDecision.Rejected(retryAfter, resetAt) =>
-            TooManyRequests(
-              RateLimitCheckResponse(
-                allowed = false,
-                tokensRemaining = Some(0),
-                retryAfter = Some(retryAfter),
-                limit = defaultProfile.capacity,
-                resetAt = resetAt.toString,
-                message = Some("Rate limit exceeded"),
-              ).asJson,
-            ).map(_.putHeaders(
-              `Retry-After`.unsafeFromDuration(retryAfter.seconds),
-            ))
-      yield response
-
-    case GET -> Root / "v1" / "ratelimit" / "status" / key =>
-      for
-        nowMs <- Clock[F].realTime.map(_.toMillis)
-        status <- store.getStatus(key, defaultProfile)
-
-        response <- status match
-          case Some(state) =>
-            val resetAt = Instant.ofEpochMilli(nowMs).plusSeconds(
-              ((defaultProfile.capacity - state.tokens) /
-                defaultProfile.refillRatePerSecond).ceil.toLong,
-            )
-            Ok(
-              RateLimitStatusResponse(
-                key = key,
-                tokensRemaining = state.tokensInt,
-                limit = defaultProfile.capacity,
-                resetAt = resetAt.toString,
-              ).asJson,
-            )
-
-          case None =>
-            // No state means full capacity (never seen this key)
-            val resetAt = Instant.ofEpochMilli(nowMs)
-            Ok(
-              RateLimitStatusResponse(
-                key = key,
-                tokensRemaining = defaultProfile.capacity,
-                limit = defaultProfile.capacity,
-                resetAt = resetAt.toString,
-              ).asJson,
-            )
-      yield response
-  }
+object RateLimitApi:
+  def apply[F[_]: Async](
+      store: RateLimitStore[F],
+      eventPublisher: EventPublisher[F],
+      metricsPublisher: MetricsPublisher[F],
+      config: RateLimitConfig,
+      logger: Logger[F]
+  ): RateLimitApi[F] =
+    new RateLimitApi[F](store, eventPublisher, metricsPublisher, config, logger)
