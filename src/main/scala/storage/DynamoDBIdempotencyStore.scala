@@ -1,140 +1,238 @@
 package storage
 
-import java.util.concurrent.{CompletableFuture, CompletionException, CompletionStage}
+import java.time.Instant
 
 import scala.jdk.CollectionConverters.*
 import scala.jdk.FutureConverters.*
 
-import org.typelevel.log4cats.Logger
-
-import config.DynamoDBConfig
-import core.{CachedResponse, IdempotencyResult, IdempotencyStore}
-import cats.effect.{Async, Clock}
+import cats.effect.*
 import cats.syntax.all.*
-import io.circe.generic.auto.*
-import io.circe.parser.decode
-import io.circe.syntax.*
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
 import software.amazon.awssdk.services.dynamodb.model.*
+import io.circe.*
+import io.circe.generic.auto.*
+import io.circe.parser.*
+import io.circe.syntax.*
+import core.{
+  IdempotencyRecord, IdempotencyResult, IdempotencyStatus, IdempotencyStore,
+  StoredResponse,
+}
 
-/** DynamoDB-backed idempotency store with first-writer-wins semantics.
-  *
-  * Uses conditional writes to ensure only the first request with a given
-  * idempotency key is processed. Subsequent requests receive the cached
-  * response.
-  *
-  * Schema: pk (String, Hash Key): "idempotency#{key}" status (String):
-  * "pending" | "completed" response (String): JSON-encoded cached response
-  * (when completed) createdAt (Number): epoch ms when key was created ttl
-  * (Number): epoch seconds for DynamoDB TTL cleanup
-  */
-class DynamoDBIdempotencyStore[F[_]: Async: Logger](
+/**
+ * DynamoDB implementation of IdempotencyStore.
+ *
+ * Uses first-writer-wins semantics with conditional writes to ensure
+ * only one instance processes a request with a given idempotency key.
+ *
+ * Table Schema:
+ * - pk (S): Partition key - "idempotency#<key>"
+ * - clientId (S): Client making the request
+ * - status (S): Pending | Completed | Failed
+ * - response (S): JSON-encoded response (if completed)
+ * - createdAt (N): Creation timestamp
+ * - updatedAt (N): Last update timestamp
+ * - version (N): Version for OCC
+ * - ttl (N): TTL for automatic cleanup
+ */
+class DynamoDBIdempotencyStore[F[_]: Async](
     client: DynamoDbAsyncClient,
-    config: DynamoDBConfig,
+    tableName: String
 ) extends IdempotencyStore[F]:
 
-  private val logger = Logger[F]
-
-  private def completionStageToCompletableFuture[T](
-      cs: CompletionStage[T],
-  ): CompletableFuture[T] =
-    val cf = new CompletableFuture[T]()
-    cs.whenComplete((result, throwable) =>
-      if throwable != null then cf.completeExceptionally(throwable)
-      else cf.complete(result),
-    )
-    cf
-
-  override def checkOrCreate(
-      key: String,
-      ttlSeconds: Long,
+  override def check(
+      idempotencyKey: String,
+      clientId: String,
+      ttlSeconds: Long
   ): F[IdempotencyResult] =
     for
-      nowMs <- Clock[F].realTime.map(_.toMillis)
-      pk = s"idempotency#$key"
-      ttlEpoch = nowMs / 1000 + ttlSeconds
-
-      // Try to create new item with condition that it doesn't exist
-      item = Map(
-        "pk" -> AttributeValue.builder().s(pk).build(),
-        "status" -> AttributeValue.builder().s("pending").build(),
-        "createdAt" -> AttributeValue.builder().n(nowMs.toString).build(),
-        "ttl" -> AttributeValue.builder().n(ttlEpoch.toString).build(),
-      )
-
-      request = PutItemRequest.builder().tableName(config.idempotencyTable)
-        .item(item.asJava).conditionExpression("attribute_not_exists(pk)").build()
-
-      result <- Async[F].fromCompletableFuture(
-        Async[F].delay(completionStageToCompletableFuture(client.putItem(request))),
-      ).map(_ => IdempotencyResult.New(key)).recoverWith {
-        case e: CompletionException if isConditionalCheckFailed(e) =>
-          // Key exists - fetch the existing record
-          getExisting(pk, key)
-        case e: ConditionalCheckFailedException => getExisting(pk, key)
+      now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
+      
+      // Try to create new record with condition
+      result <- tryCreatePending(idempotencyKey, clientId, now, ttlSeconds).flatMap {
+        case true =>
+          Async[F].pure(IdempotencyResult.New(idempotencyKey, now))
+        case false =>
+          // Record exists - check its status
+          get(idempotencyKey).map {
+            case Some(record) =>
+              record.status match
+                case IdempotencyStatus.Pending =>
+                  IdempotencyResult.InProgress(idempotencyKey, record.createdAt)
+                case IdempotencyStatus.Completed =>
+                  IdempotencyResult.Duplicate(idempotencyKey, record.response, record.createdAt)
+                case IdempotencyStatus.Failed =>
+                  // Allow retry - try to update to Pending
+                  IdempotencyResult.New(idempotencyKey, now) // Simplified: just allow retry
+            case None =>
+              // Rare race condition - record was deleted
+              IdempotencyResult.New(idempotencyKey, now)
+          }
       }
     yield result
 
-  override def storeResponse(key: String, response: CachedResponse): F[Unit] =
+  override def storeResponse(
+      idempotencyKey: String,
+      response: StoredResponse
+  ): F[Boolean] =
     for
-      pk <- Async[F].pure(s"idempotency#$key")
-      responseJson = response.asJson.noSpaces
+      now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
+      
+      request = UpdateItemRequest.builder()
+        .tableName(tableName)
+        .key(Map("pk" -> attr(s"idempotency#$idempotencyKey")).asJava)
+        .updateExpression("SET #status = :status, #response = :response, #updatedAt = :updatedAt, #version = #version + :one")
+        .conditionExpression("#status = :pending")
+        .expressionAttributeNames(Map(
+          "#status" -> "status",
+          "#response" -> "response",
+          "#updatedAt" -> "updatedAt",
+          "#version" -> "version"
+        ).asJava)
+        .expressionAttributeValues(Map(
+          ":status" -> attr("Completed"),
+          ":response" -> attr(response.asJson.noSpaces),
+          ":updatedAt" -> attrN(now.toEpochMilli),
+          ":pending" -> attr("Pending"),
+          ":one" -> attrN(1)
+        ).asJava)
+        .build()
+      
+      result <- Async[F].fromCompletableFuture(
+        Async[F].delay(client.updateItem(request).toCompletableFuture)
+      ).map(_ => true)
+        .recover {
+          case _: ConditionalCheckFailedException => false
+        }
+    yield result
 
-      request = UpdateItemRequest.builder().tableName(config.idempotencyTable)
-        .key(Map("pk" -> AttributeValue.builder().s(pk).build()).asJava)
-        .updateExpression("SET #status = :completed, #response = :response")
-        .expressionAttributeNames(
-          Map("#status" -> "status", "#response" -> "response").asJava,
-        ).expressionAttributeValues(
-          Map(
-            ":completed" -> AttributeValue.builder().s("completed").build(),
-            ":response" -> AttributeValue.builder().s(responseJson).build(),
-          ).asJava,
-        ).build()
+  override def markFailed(idempotencyKey: String): F[Boolean] =
+    for
+      now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
+      
+      request = UpdateItemRequest.builder()
+        .tableName(tableName)
+        .key(Map("pk" -> attr(s"idempotency#$idempotencyKey")).asJava)
+        .updateExpression("SET #status = :status, #updatedAt = :updatedAt")
+        .conditionExpression("attribute_exists(pk)")
+        .expressionAttributeNames(Map(
+          "#status" -> "status",
+          "#updatedAt" -> "updatedAt"
+        ).asJava)
+        .expressionAttributeValues(Map(
+          ":status" -> attr("Failed"),
+          ":updatedAt" -> attrN(now.toEpochMilli)
+        ).asJava)
+        .build()
+      
+      result <- Async[F].fromCompletableFuture(
+        Async[F].delay(client.updateItem(request).toCompletableFuture)
+      ).map(_ => true)
+        .recover {
+          case _: ConditionalCheckFailedException => false
+        }
+    yield result
 
-      _ <- Async[F].fromCompletableFuture(
-        Async[F].delay(completionStageToCompletableFuture(client.updateItem(request))),
-      ).void.handleErrorWith(e =>
-        logger.error(e)(s"Failed to store response for idempotency key=$key"),
-      )
-    yield ()
-
-  override def healthCheck: F[Boolean] =
-    val request = DescribeTableRequest.builder()
-      .tableName(config.idempotencyTable).build()
+  override def get(idempotencyKey: String): F[Option[IdempotencyRecord]] =
+    val request = GetItemRequest.builder()
+      .tableName(tableName)
+      .key(Map("pk" -> attr(s"idempotency#$idempotencyKey")).asJava)
+      .consistentRead(true)
+      .build()
 
     Async[F].fromCompletableFuture(
-      Async[F].delay(completionStageToCompletableFuture(client.describeTable(request))),
-    ).map(_ => true).handleError(_ => false)
-
-  // --- Private helpers ---
-
-  private def getExisting(pk: String, key: String): F[IdempotencyResult] =
-    val request = GetItemRequest.builder().tableName(config.idempotencyTable)
-      .key(Map("pk" -> AttributeValue.builder().s(pk).build()).asJava)
-      .consistentRead(true).build()
-
-    Async[F].fromCompletableFuture(
-      Async[F].delay(completionStageToCompletableFuture(client.getItem(request))),
-    ).flatMap { response =>
-      val item = response.item()
-      if item == null || item.isEmpty then
-        // Race condition: item was deleted between our failed write and read
-        // Treat as new
-        logger.debug(s"Idempotency key=$key disappeared, treating as new") *>
-          Async[F].pure(IdempotencyResult.New(key))
+      Async[F].delay(client.getItem(request).toCompletableFuture)
+    ).map { response =>
+      if response.hasItem && !response.item().isEmpty then
+        Some(parseRecord(idempotencyKey, response.item().asScala.toMap))
       else
-        val status = item.get("status").s()
-        val cachedResponse = Option(item.get("response")).map(_.s())
-          .flatMap(json => decode[CachedResponse](json).toOption)
-
-        Async[F].pure(
-          IdempotencyResult
-            .Duplicate(key, cachedResponse.filter(_ => status == "completed")),
-        )
+        None
     }
 
-  private def isConditionalCheckFailed(e: CompletionException): Boolean =
-    e.getCause match
-      case _: ConditionalCheckFailedException => true
-      case _ => false
+  override def healthCheck: F[Boolean] =
+    Async[F].fromCompletableFuture(
+      Async[F].delay(
+        client.describeTable(
+          DescribeTableRequest.builder().tableName(tableName).build()
+        ).toCompletableFuture
+      )
+    ).map(_ => true).handleError(_ => false)
+
+  private def tryCreatePending(
+      idempotencyKey: String,
+      clientId: String,
+      now: Instant,
+      ttlSeconds: Long
+  ): F[Boolean] =
+    val ttl = now.getEpochSecond + ttlSeconds
+    
+    val item = Map(
+      "pk" -> attr(s"idempotency#$idempotencyKey"),
+      "clientId" -> attr(clientId),
+      "status" -> attr("Pending"),
+      "createdAt" -> attrN(now.toEpochMilli),
+      "updatedAt" -> attrN(now.toEpochMilli),
+      "version" -> attrN(1),
+      "ttl" -> attrN(ttl)
+    )
+
+    val request = PutItemRequest.builder()
+      .tableName(tableName)
+      .item(item.asJava)
+      .conditionExpression("attribute_not_exists(pk) OR #status = :failed")
+      .expressionAttributeNames(Map("#status" -> "status").asJava)
+      .expressionAttributeValues(Map(":failed" -> attr("Failed")).asJava)
+      .build()
+
+    Async[F].fromCompletableFuture(
+      Async[F].delay(client.putItem(request).toCompletableFuture)
+    ).map(_ => true)
+      .recover {
+        case _: ConditionalCheckFailedException => false
+      }
+
+  private def parseRecord(
+      idempotencyKey: String,
+      item: Map[String, AttributeValue]
+  ): IdempotencyRecord =
+    val status = item.get("status").map(_.s()) match
+      case Some("Pending") => IdempotencyStatus.Pending
+      case Some("Completed") => IdempotencyStatus.Completed
+      case Some("Failed") => IdempotencyStatus.Failed
+      case _ => IdempotencyStatus.Pending
+    
+    val response = item.get("response").flatMap { attr =>
+      decode[StoredResponse](attr.s()).toOption
+    }
+    
+    val createdAt = item.get("createdAt")
+      .map(a => Instant.ofEpochMilli(a.n().toLong))
+      .getOrElse(Instant.now())
+    
+    val updatedAt = item.get("updatedAt")
+      .map(a => Instant.ofEpochMilli(a.n().toLong))
+      .getOrElse(createdAt)
+
+    IdempotencyRecord(
+      idempotencyKey = idempotencyKey,
+      clientId = item.get("clientId").map(_.s()).getOrElse("unknown"),
+      status = status,
+      response = response,
+      createdAt = createdAt,
+      updatedAt = updatedAt,
+      ttl = item.get("ttl").map(_.n().toLong).getOrElse(0L),
+      version = item.get("version").map(_.n().toLong).getOrElse(0L)
+    )
+
+  // Helper methods for building AttributeValues
+  private def attr(s: String): AttributeValue =
+    AttributeValue.builder().s(s).build()
+
+  private def attrN(n: Long): AttributeValue =
+    AttributeValue.builder().n(n.toString).build()
+
+object DynamoDBIdempotencyStore:
+  def apply[F[_]: Async](
+      client: DynamoDbAsyncClient,
+      tableName: String
+  ): DynamoDBIdempotencyStore[F] =
+    new DynamoDBIdempotencyStore[F](client, tableName)

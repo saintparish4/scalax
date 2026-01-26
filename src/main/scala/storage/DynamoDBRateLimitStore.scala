@@ -1,240 +1,200 @@
 package storage
 
-import java.time.Instant
-import java.util.concurrent.{CompletableFuture, CompletionException, CompletionStage}
-
-import scala.jdk.CollectionConverters.*
-import scala.jdk.FutureConverters.*
-
-import org.typelevel.log4cats.Logger
-
-import config.DynamoDBConfig
-import core.{
-  RateLimitDecision, RateLimitProfile, RateLimitStore, TokenBucketState,
-}
-import cats.effect.{Async, Clock}
+import cats.effect.*
 import cats.syntax.all.*
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
 import software.amazon.awssdk.services.dynamodb.model.*
+import scala.jdk.CollectionConverters.*
+import scala.jdk.FutureConverters.*
+import java.time.Instant 
 
-/** DynamoDB-backed rate limit store with atomic operations.
-  *
-  * Uses Optimistic Concurrency Control (OCC) with a version field to ensure
-  * atomic check-and-decrement operations. Under contention, operations are
-  * retried with exponential backoff.
-  *
-  * Schema: pk (String, Hash Key): "ratelimit#{key}" tokens (Number): current
-  * token count lastRefillEpochMs (Number): timestamp of last refill calculation
-  * version (Number): monotonically increasing version for OCC ttl (Number):
-  * epoch seconds for DynamoDB TTL cleanup
-  */
-class DynamoDBRateLimitStore[F[_]: Async: Logger](
+import core.{RateLimitDecision, RateLimitProfile, RateLimitStore} 
+
+/**
+ * DynamoDB implementation of RateLimitStore using token bucket algorithm.
+ *
+ * Uses optimistic concurrency control (OCC) via version field to prevent
+ * race conditions when multiple instances try to update the same key.
+ *
+ * Table Schema:
+ * - pk (S): Partition key - "ratelimit#<key>"
+ * - tokens (N): Current token count
+ * - lastRefillMs (N): Timestamp of last refill calculation
+ * - version (N): Version for OCC
+ * - ttl (N): TTL for automatic cleanup
+ */
+class DynamoDBRateLimitStore[F[_]: Async](
     client: DynamoDbAsyncClient,
-    config: DynamoDBConfig,
-    maxRetries: Int = 5,
+    tableName: String
 ) extends RateLimitStore[F]:
 
-  private val logger = Logger[F]
-
-  private def completionStageToCompletableFuture[T](
-      cs: CompletionStage[T],
-  ): CompletableFuture[T] =
-    val cf = new CompletableFuture[T]()
-    cs.whenComplete((result, throwable) =>
-      if throwable != null then cf.completeExceptionally(throwable)
-      else cf.complete(result),
-    )
-    cf
+  private val MaxRetries = 3
 
   override def checkAndConsume(
       key: String,
       cost: Int,
-      profile: RateLimitProfile,
+      profile: RateLimitProfile
   ): F[RateLimitDecision] =
-    checkAndConsumeWithRetry(key, cost, profile, attempt = 0)
+    checkAndConsumeWithRetry(key, cost, profile, MaxRetries)
 
-  /** Core atomic check-and-consume with retry logic.
-    *
-    * Pattern:
-    *   1. Read current state (or initialize if new)
-    *   2. Calculate refilled tokens based on elapsed time
-    *   3. Decide allow/reject based on available tokens
-    *   4. If allow: write new state with version condition
-    *   5. If condition fails (concurrent modification): retry
-    */
   private def checkAndConsumeWithRetry(
       key: String,
       cost: Int,
       profile: RateLimitProfile,
-      attempt: Int,
+      retriesRemaining: Int
   ): F[RateLimitDecision] =
     for
-      nowMs <- Clock[F].realTime.map(_.toMillis)
-      pk = s"ratelimit#$key"
-
-      // Step 1: Read current state
-      currentState <- getState(pk)
-
-      // Step 2: Calculate refilled tokens
-      state = currentState.getOrElse(initialState(profile, nowMs))
-      elapsedMs = nowMs - state.lastRefillEpochMs
-      tokensToAdd = elapsedMs / 1000.0 * profile.refillRatePerSecond
-      refilledTokens = math.min(profile.capacity.toDouble, state.tokens + tokensToAdd)
+      now <- Clock[F].realTime.map(_.toMillis)
       
-      // Ensure refilledTokens doesn't exceed capacity due to floating point precision
-      // Also ensure it's not negative and clamp to reasonable precision
-      clampedRefilledTokens = math.min(profile.capacity.toDouble, math.max(0.0, refilledTokens))
-      // Round to avoid floating point precision issues that could allow requests when tokens are effectively 0
-      roundedTokens = math.round(clampedRefilledTokens * 1000.0) / 1000.0
-
-      // Calculate reset time (when bucket will be full)
-      tokensToFull = profile.capacity.toDouble - roundedTokens
-      secondsToFull = (tokensToFull / profile.refillRatePerSecond).ceil.toLong
-      resetAt = Instant.ofEpochMilli(nowMs).plusSeconds(secondsToFull)
-
-      // Step 3: Decide
-      decision <-
-        if roundedTokens >= cost then
-          // Allow: attempt atomic write
-          val newTokens = math.max(0.0, roundedTokens - cost)
-          val newState = TokenBucketState(newTokens, nowMs, state.version + 1)
-
-          conditionalPutState(pk, newState, state.version, profile.ttlSeconds)
-            .flatMap {
-              case true =>
-                // Success
-                Async[F].pure(RateLimitDecision.Allowed(newTokens.toInt, resetAt))
-
-              case false =>
-                // Concurrent modification - retry
-                if attempt < maxRetries then
-                  logger.debug(s"OCC conflict for key=$key, attempt=${attempt +
-                      1}") *>
-                    // Exponential backoff: 10ms, 20ms, 40ms, 80ms, 160ms
-                    Async[F].sleep(
-                      scala.concurrent.duration
-                        .Duration(10L * (1L << attempt), "ms"),
-                    ) *>
-                    checkAndConsumeWithRetry(key, cost, profile, attempt + 1)
-                else
-                  // Max retries exceeded - reject to be safe
-                  logger.warn(
-                    s"Max retries exceeded for key=$key, rejecting request",
-                  ) *> Async[F].pure(RateLimitDecision.Rejected(1, resetAt))
-            }
-        else
-          // Reject: not enough tokens
-          val secondsUntilAllowed =
-            ((cost - roundedTokens) / profile.refillRatePerSecond).ceil.toInt
-          Async[F].pure(
-            RateLimitDecision.Rejected(math.max(1, secondsUntilAllowed), resetAt),
-          )
+      // Get current state
+      currentState <- getOrInitState(key, profile, now)
+      
+      // Calculate refilled tokens
+      elapsed = (now - currentState.lastRefillMs) / 1000.0
+      tokensToAdd = elapsed * profile.refillRatePerSecond
+      refilledTokens = math.min(profile.capacity.toDouble, currentState.tokens + tokensToAdd)
+      
+      // Decide and attempt update
+      decision <- if refilledTokens >= cost then
+        val newTokens = refilledTokens - cost
+        val newState = TokenBucketState(newTokens, now, currentState.version + 1)
+        
+        attemptUpdate(key, currentState.version, newState, profile.ttlSeconds).flatMap {
+          case true =>
+            val resetAt = calculateResetAt(now, newTokens, profile)
+            Async[F].pure(RateLimitDecision.Allowed(newTokens.toInt, resetAt))
+          case false =>
+            // OCC conflict - retry
+            if retriesRemaining > 0 then
+              checkAndConsumeWithRetry(key, cost, profile, retriesRemaining - 1)
+            else
+              // Give up, reject to be safe
+              val resetAt = calculateResetAt(now, refilledTokens, profile)
+              Async[F].pure(RateLimitDecision.Rejected(1, resetAt))
+        }
+      else
+        val retryAfter = math.ceil((cost - refilledTokens) / profile.refillRatePerSecond).toInt.max(1)
+        val resetAt = calculateResetAt(now, refilledTokens, profile)
+        Async[F].pure(RateLimitDecision.Rejected(retryAfter, resetAt))
     yield decision
 
   override def getStatus(
       key: String,
-      profile: RateLimitProfile,
-  ): F[Option[TokenBucketState]] =
+      profile: RateLimitProfile
+  ): F[Option[RateLimitDecision.Allowed]] =
     for
-      nowMs <- Clock[F].realTime.map(_.toMillis)
-      pk = s"ratelimit#$key"
-      state <- getState(pk)
-    yield state.map { s =>
-      // Return with refilled tokens for accurate status
-      val elapsedMs = nowMs - s.lastRefillEpochMs
-      val tokensToAdd = elapsedMs / 1000.0 * profile.refillRatePerSecond
-      val refilledTokens = math
-        .min(profile.capacity.toDouble, s.tokens + tokensToAdd)
-      s.copy(tokens = refilledTokens, lastRefillEpochMs = nowMs)
-    }
-
-  override def healthCheck: F[Boolean] =
-    val request = DescribeTableRequest.builder().tableName(config.rateLimitTable)
-      .build()
-
-    Async[F].fromCompletableFuture(
-      Async[F].delay(completionStageToCompletableFuture(client.describeTable(request))),
-    ).map(_ => true).handleError(_ => false)
-
-  // --- Private helpers ---
-
-  private def initialState(
-      profile: RateLimitProfile,
-      nowMs: Long,
-  ): TokenBucketState = TokenBucketState(
-    tokens = profile.capacity.toDouble,
-    lastRefillEpochMs = nowMs,
-    version = 0L,
-  )
-
-  private def getState(pk: String): F[Option[TokenBucketState]] =
-    val request = GetItemRequest.builder().tableName(config.rateLimitTable)
-      .key(Map("pk" -> AttributeValue.builder().s(pk).build()).asJava)
-      .consistentRead(true) // Strong consistency for accurate token count
-      .build()
-
-    Async[F].fromCompletableFuture(
-      Async[F].delay(completionStageToCompletableFuture(client.getItem(request))),
-    ).map { response =>
-      val item = response.item()
-      if item == null || item.isEmpty then None
-      else
-        Some(TokenBucketState(
-          tokens = item.get("tokens").n().toDouble,
-          lastRefillEpochMs = item.get("lastRefillEpochMs").n().toLong,
-          version = item.get("version").n().toLong,
-        ))
-    }
-
-  /** Conditionally put state, succeeding only if version matches. Returns true
-    * if write succeeded, false if version mismatch.
-    */
-  private def conditionalPutState(
-      pk: String,
-      state: TokenBucketState,
-      expectedVersion: Long,
-      ttlSeconds: Long,
-  ): F[Boolean] =
-    for
-      nowMs <- Clock[F].realTime.map(_.toMillis)
-      ttlEpoch = nowMs / 1000 + ttlSeconds
-
-      item = Map(
-        "pk" -> AttributeValue.builder().s(pk).build(),
-        "tokens" -> AttributeValue.builder().n(state.tokens.toString).build(),
-        "lastRefillEpochMs" -> AttributeValue.builder()
-          .n(state.lastRefillEpochMs.toString).build(),
-        "version" -> AttributeValue.builder().n(state.version.toString).build(),
-        "ttl" -> AttributeValue.builder().n(ttlEpoch.toString).build(),
-      )
-
-      // Build request with condition based on whether this is new or existing
-      request =
-        if expectedVersion == 0L then
-          // New item: condition that pk doesn't exist
-          PutItemRequest.builder().tableName(config.rateLimitTable)
-            .item(item.asJava).conditionExpression("attribute_not_exists(pk)")
-            .build()
-        else
-          // Existing item: condition that version matches
-          PutItemRequest.builder().tableName(config.rateLimitTable)
-            .item(item.asJava).conditionExpression("version = :expectedVersion")
-            .expressionAttributeValues(
-              Map(
-                ":expectedVersion" -> AttributeValue.builder()
-                  .n(expectedVersion.toString).build(),
-              ).asJava,
-            ).build()
-
-      result <- Async[F].fromCompletableFuture(
-        Async[F].delay(completionStageToCompletableFuture(client.putItem(request))),
-      ).map(_ => true).recover {
-        case e: CompletionException if isConditionalCheckFailed(e) => false
-        case e: ConditionalCheckFailedException => false
+      now <- Clock[F].realTime.map(_.toMillis)
+      maybeState <- getState(key)
+      result = maybeState.map { state =>
+        val elapsed = (now - state.lastRefillMs) / 1000.0
+        val tokensToAdd = elapsed * profile.refillRatePerSecond
+        val refilledTokens = math.min(profile.capacity.toDouble, state.tokens + tokensToAdd)
+        val resetAt = calculateResetAt(now, refilledTokens, profile)
+        RateLimitDecision.Allowed(refilledTokens.toInt, resetAt)
       }
     yield result
 
-  private def isConditionalCheckFailed(e: CompletionException): Boolean =
-    e.getCause match
-      case _: ConditionalCheckFailedException => true
-      case _ => false
+  override def healthCheck: F[Boolean] =
+    Async[F].fromCompletableFuture(
+      Async[F].delay(
+        client.describeTable(
+          DescribeTableRequest.builder().tableName(tableName).build()
+        ).toCompletableFuture
+      )
+    ).map(_ => true).handleError(_ => false)
+
+  private def getOrInitState(
+      key: String,
+      profile: RateLimitProfile,
+      now: Long
+  ): F[TokenBucketState] =
+    getState(key).map(_.getOrElse(
+      TokenBucketState(profile.capacity.toDouble, now, 0L)
+    ))
+
+  private def getState(key: String): F[Option[TokenBucketState]] =
+    val request = GetItemRequest.builder()
+      .tableName(tableName)
+      .key(Map("pk" -> AttributeValue.builder().s(s"ratelimit#$key").build()).asJava)
+      .consistentRead(true)
+      .build()
+
+    Async[F].fromCompletableFuture(
+      Async[F].delay(client.getItem(request).toCompletableFuture)
+    ).map { response =>
+      if response.hasItem && !response.item().isEmpty then
+        Some(parseState(response.item().asScala.toMap))
+      else
+        None
+    }
+
+  private def parseState(item: Map[String, AttributeValue]): TokenBucketState =
+    TokenBucketState(
+      tokens = item.get("tokens").map(_.n().toDouble).getOrElse(0.0),
+      lastRefillMs = item.get("lastRefillMs").map(_.n().toLong).getOrElse(0L),
+      version = item.get("version").map(_.n().toLong).getOrElse(0L)
+    )
+
+  private def attemptUpdate(
+      key: String,
+      expectedVersion: Long,
+      newState: TokenBucketState,
+      ttlSeconds: Long
+  ): F[Boolean] =
+    val ttl = (System.currentTimeMillis() / 1000) + ttlSeconds
+    
+    val item = Map(
+      "pk" -> AttributeValue.builder().s(s"ratelimit#$key").build(),
+      "tokens" -> AttributeValue.builder().n(newState.tokens.toString).build(),
+      "lastRefillMs" -> AttributeValue.builder().n(newState.lastRefillMs.toString).build(),
+      "version" -> AttributeValue.builder().n(newState.version.toString).build(),
+      "ttl" -> AttributeValue.builder().n(ttl.toString).build()
+    )
+
+    val requestBuilder = PutItemRequest.builder()
+      .tableName(tableName)
+      .item(item.asJava)
+
+    // Add conditional expression for OCC
+    val request = if expectedVersion == 0L then
+      // First write - item should not exist
+      requestBuilder
+        .conditionExpression("attribute_not_exists(pk)")
+        .build()
+    else
+      // Update - version must match
+      requestBuilder
+        .conditionExpression("version = :expectedVersion")
+        .expressionAttributeValues(Map(
+          ":expectedVersion" -> AttributeValue.builder().n(expectedVersion.toString).build()
+        ).asJava)
+        .build()
+
+    Async[F].fromCompletableFuture(
+      Async[F].delay(client.putItem(request).toCompletableFuture)
+    ).map(_ => true)
+      .recover {
+        case _: ConditionalCheckFailedException => false
+      }
+
+  private def calculateResetAt(
+      now: Long,
+      currentTokens: Double,
+      profile: RateLimitProfile
+  ): Instant =
+    val tokensToFull = profile.capacity - currentTokens
+    val secondsToFull = (tokensToFull / profile.refillRatePerSecond).ceil.toLong
+    Instant.ofEpochMilli(now + (secondsToFull * 1000))
+
+private case class TokenBucketState(
+    tokens: Double,
+    lastRefillMs: Long,
+    version: Long
+)
+
+object DynamoDBRateLimitStore:
+  def apply[F[_]: Async](
+      client: DynamoDbAsyncClient,
+      tableName: String
+  ): DynamoDBRateLimitStore[F] =
+    new DynamoDBRateLimitStore[F](client, tableName)

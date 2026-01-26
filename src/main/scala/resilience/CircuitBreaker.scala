@@ -1,0 +1,229 @@
+package resilience
+
+import scala.concurrent.duration.*
+
+import org.typelevel.log4cats.Logger
+
+import cats.effect.*
+import cats.effect.std.Semaphore
+import cats.syntax.all.*
+
+/** Circuit Breaker implementation for resilience against cascading failures.
+  *
+  * States:
+  *   - Closed: Normal operation, requests pass through
+  *   - Open: Requests fail fast without calling the protected resource
+  *   - HalfOpen: Limited requests allowed to test if the resource recovered
+  *
+  * Transitions:
+  *   - Closed -> Open: When failure count exceeds threshold within window
+  *   - Open -> HalfOpen: After reset timeout expires
+  *   - HalfOpen -> Closed: When a probe request succeeds
+  *   - HalfOpen -> Open: When a probe request fails
+  */
+trait CircuitBreaker[F[_]]:
+  /** Protect a call with the circuit breaker.
+    *
+    * @param fa
+    *   The effect to protect
+    * @return
+    *   The result, or fails with CircuitBreakerOpen if the breaker is open
+    */
+  def protect[A](fa: F[A]): F[A]
+
+  /** Get current circuit state */
+  def state: F[CircuitState]
+
+  /** Get circuit breaker metrics */
+  def metrics: F[CircuitBreakerMetrics]
+
+sealed trait CircuitState
+object CircuitState:
+  case object Closed extends CircuitState
+  case object Open extends CircuitState
+  case object HalfOpen extends CircuitState
+
+case class CircuitBreakerMetrics(
+    state: CircuitState,
+    failureCount: Int,
+    successCount: Int,
+    rejectedCount: Long,
+    lastFailureTime: Option[Long],
+    lastSuccessTime: Option[Long],
+)
+
+case class CircuitBreakerConfig(
+    maxFailures: Int = 5,
+    resetTimeout: FiniteDuration = 30.seconds,
+    halfOpenMaxCalls: Int = 3,
+    failureRateThreshold: Double = 0.5,
+    slidingWindowSize: Int = 10,
+)
+
+object CircuitBreakerConfig:
+  val default: CircuitBreakerConfig = CircuitBreakerConfig()
+
+  val aggressive: CircuitBreakerConfig = CircuitBreakerConfig(
+    maxFailures = 3,
+    resetTimeout = 15.seconds,
+    halfOpenMaxCalls = 1,
+  )
+
+  val relaxed: CircuitBreakerConfig = CircuitBreakerConfig(
+    maxFailures = 10,
+    resetTimeout = 60.seconds,
+    halfOpenMaxCalls = 5,
+  )
+
+case class CircuitBreakerOpen(name: String)
+    extends RuntimeException(s"Circuit breaker '$name' is open")
+
+object CircuitBreaker:
+
+  private case class InternalState(
+      circuitState: CircuitState,
+      failures: Int,
+      successes: Int,
+      rejectedCount: Long,
+      lastFailureTime: Option[Long],
+      lastSuccessTime: Option[Long],
+      openedAt: Option[Long],
+      halfOpenCalls: Int,
+  )
+
+  private object InternalState:
+    def initial: InternalState = InternalState(
+      circuitState = CircuitState.Closed,
+      failures = 0,
+      successes = 0,
+      rejectedCount = 0,
+      lastFailureTime = None,
+      lastSuccessTime = None,
+      openedAt = None,
+      halfOpenCalls = 0,
+    )
+
+  def apply[F[_]: Temporal: Logger](
+      name: String,
+      config: CircuitBreakerConfig = CircuitBreakerConfig.default,
+  ): F[CircuitBreaker[F]] =
+    for
+      stateRef <- Ref.of[F, InternalState](InternalState.initial)
+      semaphore <- Semaphore[F](1) // For half-open state coordination
+    yield new CircuitBreaker[F]:
+      private val logger = Logger[F]
+
+      override def protect[A](fa: F[A]): F[A] =
+        for
+          now <- Clock[F].realTime.map(_.toMillis)
+          currentState <- stateRef.get
+          result <- currentState.circuitState match
+            case CircuitState.Closed => executeAndRecord(fa, now)
+
+            case CircuitState.Open => checkAndMaybeTransitionToHalfOpen(now) *>
+                stateRef.get.flatMap(s =>
+                  if s.circuitState == CircuitState.HalfOpen then
+                    executeHalfOpen(fa, now)
+                  else
+                    recordRejection *>
+                      Temporal[F].raiseError(CircuitBreakerOpen(name)),
+                )
+
+            case CircuitState.HalfOpen => executeHalfOpen(fa, now)
+        yield result
+
+      override def state: F[CircuitState] = stateRef.get.map(_.circuitState)
+
+      override def metrics: F[CircuitBreakerMetrics] = stateRef.get.map(s =>
+        CircuitBreakerMetrics(
+          state = s.circuitState,
+          failureCount = s.failures,
+          successCount = s.successes,
+          rejectedCount = s.rejectedCount,
+          lastFailureTime = s.lastFailureTime,
+          lastSuccessTime = s.lastSuccessTime,
+        ),
+      )
+
+      private def executeAndRecord[A](fa: F[A], now: Long): F[A] = fa.attempt
+        .flatMap {
+          case Right(result) => recordSuccess(now).as(result)
+          case Left(error) => recordFailure(now) *> checkAndMaybeOpen(now) *>
+              Temporal[F].raiseError(error)
+        }
+
+      private def executeHalfOpen[A](fa: F[A], now: Long): F[A] = semaphore
+        .tryPermit.use { acquired =>
+          if acquired then
+            stateRef.get.flatMap { s =>
+              if s.halfOpenCalls >= config.halfOpenMaxCalls then
+                recordRejection *>
+                  Temporal[F].raiseError(CircuitBreakerOpen(name))
+              else
+                stateRef.update(_.copy(halfOpenCalls = s.halfOpenCalls + 1)) *>
+                  fa.attempt.flatMap {
+                    case Right(result) => transitionToClosed(now) *> logger.info(
+                        s"Circuit breaker '$name' closed after successful probe",
+                      ) *> Temporal[F].pure(result)
+                    case Left(error) => transitionToOpen(now) *> logger.warn(
+                        s"Circuit breaker '$name' reopened after failed probe",
+                      ) *> Temporal[F].raiseError(error)
+                  }
+            }
+          else recordRejection *> Temporal[F].raiseError(CircuitBreakerOpen(name))
+        }
+
+      private def recordSuccess(now: Long): F[Unit] = stateRef.update(s =>
+        s.copy(
+          successes = s.successes + 1,
+          lastSuccessTime = Some(now),
+          // Reset failures on success in closed state
+          failures =
+            if s.circuitState == CircuitState.Closed then 0 else s.failures,
+        ),
+      )
+
+      private def recordFailure(now: Long): F[Unit] = stateRef.update(s =>
+        s.copy(failures = s.failures + 1, lastFailureTime = Some(now)),
+      )
+
+      private def recordRejection: F[Unit] = stateRef
+        .update(s => s.copy(rejectedCount = s.rejectedCount + 1))
+
+      private def checkAndMaybeOpen(now: Long): F[Unit] = stateRef.get
+        .flatMap(s =>
+          if s.failures >= config.maxFailures then
+            transitionToOpen(now) *>
+              logger.warn(s"Circuit breaker '$name' opened after ${s
+                  .failures} failures")
+          else Temporal[F].unit,
+        )
+
+      private def checkAndMaybeTransitionToHalfOpen(now: Long): F[Unit] =
+        stateRef.get.flatMap(s =>
+          s.openedAt match
+            case Some(openTime)
+                if now - openTime >= config.resetTimeout.toMillis =>
+              stateRef.update(
+                _.copy(circuitState = CircuitState.HalfOpen, halfOpenCalls = 0),
+              ) *>
+                logger
+                  .info(s"Circuit breaker '$name' transitioning to half-open")
+            case _ => Temporal[F].unit,
+        )
+
+      private def transitionToOpen(now: Long): F[Unit] = stateRef.update(_.copy(
+        circuitState = CircuitState.Open,
+        openedAt = Some(now),
+        halfOpenCalls = 0,
+      ))
+
+      private def transitionToClosed(now: Long): F[Unit] = stateRef
+        .update(_.copy(
+          circuitState = CircuitState.Closed,
+          failures = 0,
+          successes = 0,
+          openedAt = None,
+          halfOpenCalls = 0,
+          lastSuccessTime = Some(now),
+        ))

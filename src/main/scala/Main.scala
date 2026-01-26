@@ -1,94 +1,131 @@
 package com.ratelimiter
 
-import org.http4s.ember.server.EmberServerBuilder
-import org.typelevel.log4cats.slf4j.Slf4jLogger
-import org.typelevel.log4cats.{Logger, LoggerFactory}
-
-import com.comcast.ip4s.*
-
-import com.ratelimiter.api.Routes
-import config.AppConfig
-import events.{EventPublisher, KinesisPublisher}
-import storage.{AwsClients, DynamoDBIdempotencyStore, DynamoDBRateLimitStore}
 import cats.effect.*
 import cats.syntax.all.*
+import com.comcast.ip4s.*
+import org.http4s.ember.server.EmberServerBuilder
+import org.http4s.server.Server
+import org.typelevel.log4cats.slf4j.Slf4jLogger
+import org.typelevel.log4cats.Logger
+
+import com.ratelimiter.api.Routes
+import com.ratelimiter.config.AppConfig
+import com.ratelimiter.core.*
+import com.ratelimiter.events.*
+import com.ratelimiter.metrics.*
+import com.ratelimiter.resilience.*
+import com.ratelimiter.security.*
+import com.ratelimiter.storage.*
+import security.SecretsConfig
+
+import scala.concurrent.duration.*
 
 object Main extends IOApp:
 
-  override def run(args: List[String]): IO[ExitCode] = application[IO]
-    .use(_ => IO.never).as(ExitCode.Success)
+  override def run(args: List[String]): IO[ExitCode] =
+    application.useForever.as(ExitCode.Success)
 
-  /** Build the application as a Resource that properly manages all lifecycles.
-    *
-    * Resource acquisition order:
-    *   1. Logger
-    *   2. Configuration
-    *   3. AWS clients (DynamoDB, Kinesis)
-    *   4. Storage implementations
-    *   5. HTTP server
-    *
-    * On shutdown, resources are released in reverse order.
-    */
-  def application[F[_]: Async]: Resource[F, Unit] =
+  private def application: Resource[IO, Server] =
     for
-      // 1. Create logger
-      given Logger[F] <- Resource.eval(Slf4jLogger.create[F])
-      logger = summon[Logger[F]]
-
+      // Initialize logger
+      given Logger[IO] <- Resource.eval(Slf4jLogger.create[IO])
+      logger = summon[Logger[IO]]
       _ <- Resource.eval(logger.info("Starting Rate Limiter Platform..."))
 
-      // 2. Load configuration
-      config <- Resource.eval(AppConfig.load[F])
-      _ <- Resource.eval(logger.info(s"Loaded configuration: server=${config
-          .server.host}:${config.server.port}"))
+      // Load configuration
+      config <- Resource.eval(AppConfig.loadOrDefault[IO])
+      _ <- Resource.eval(logger.info(s"Configuration loaded: ${config.server.host}:${config.server.port}"))
 
-      // 3. Create AWS clients with proper lifecycle management
-      dynamoClient <- AwsClients.dynamoDbClient[F](config.aws)
-      _ <- Resource.eval(logger.info("DynamoDB client initialized"))
+      // Initialize metrics publisher
+      metricsPublisher <- config.metrics.enabled match
+        case true => MetricsPublisher.cloudWatch[IO](config.aws.region, config.metrics.namespace)
+        case false => Resource.pure[IO, MetricsPublisher[IO]](MetricsPublisher.noop[IO])
+      _ <- Resource.eval(logger.info("Metrics publisher initialized"))
 
-      kinesisClient <- AwsClients.kinesisClient[F](config.aws)
-      _ <- Resource.eval(logger.info("Kinesis client initialized"))
+      // Initialize event publisher
+      eventPublisher <- config.kinesis.enabled match
+        case true => 
+          for
+            kinesisClient <- AwsClients.kinesisClient[IO](config.aws)
+            kinesisPublisher = new KinesisPublisher[IO](kinesisClient, config.kinesis)
+            buffered <- EventPublisher.buffered[IO](
+              kinesisPublisher, 
+              config.kinesis.batchSize,
+              config.kinesis.flushInterval
+            )
+          yield buffered
+        case false => 
+          Resource.pure[IO, EventPublisher[IO]](EventPublisher.noop[IO])
+      _ <- Resource.eval(logger.info("Event publisher initialized"))
 
-      // 4. Create storage implementations
-      rateLimitStore = new DynamoDBRateLimitStore[F](
-        dynamoClient,
-        config.dynamodb,
-        maxRetries = 5,
+      // Initialize rate limit store
+      rateLimitStore <- config.aws.localstack match
+        case true =>
+          // Use in-memory for local development
+          Resource.eval(RateLimitStore.inMemory[IO])
+        case false =>
+          // Use DynamoDB for production
+          for
+            dynamoClient <- AwsClients.dynamoDbClient[IO](config.aws)
+            store = new DynamoDBRateLimitStore[IO](dynamoClient, config.dynamodb, maxRetries = 5)
+          yield store
+      _ <- Resource.eval(logger.info("Rate limit store initialized"))
+
+      // Initialize idempotency store
+      idempotencyStore <- config.aws.localstack match
+        case true =>
+          Resource.eval(IdempotencyStore.inMemory[IO])
+        case false =>
+          for
+            dynamoClient <- AwsClients.dynamoDbClient[IO](config.aws)
+            store = new DynamoDBIdempotencyStore[IO](dynamoClient, config.dynamodb)
+          yield store
+      _ <- Resource.eval(logger.info("Idempotency store initialized"))
+
+      // Initialize API key store
+      apiKeyStore <- config.security.secrets.enabled match
+        case true =>
+          for
+            secretsClient <- SecretsManagerStore.clientResource[IO](config.aws)
+            secretsConfig = security.SecretsConfig(
+              environment = "dev",
+              secretPrefix = config.security.secrets.secretPrefix,
+              cacheTtl = config.security.secrets.cacheTtl,
+              apiKeysSecretName = config.security.secrets.apiKeysSecretName
+            )
+            secretStore <- Resource.eval(SecretsManagerStore[IO](secretsClient, secretsConfig))
+            store <- Resource.eval(SecretsManagerApiKeyStore[IO](secretStore, config.security.secrets.cacheTtl))
+          yield store
+        case false =>
+          Resource.pure[IO, ApiKeyStore[IO]](ApiKeyStore.inMemory[IO](ApiKeyStore.testKeys))
+      _ <- Resource.eval(logger.info("API key store initialized"))
+
+      // Create auth rate limiter
+      authRateLimiter <- Resource.eval(AuthRateLimiter.inMemory[IO](
+        maxRequestsPerMinute = config.security.authentication.rateLimitPerMinute,
+        maxFailedAttemptsPerMinute = config.security.authentication.maxFailedAttempts
+      ))
+
+      // Create authentication middleware
+      authMiddleware = ApiKeyAuth.middleware[IO](apiKeyStore, Some(authRateLimiter))
+
+      // Create HTTP routes
+      routes = new Routes[IO](
+        rateLimitStore,
+        idempotencyStore,
+        eventPublisher,
+        config
       )
+      _ <- Resource.eval(logger.info("HTTP routes initialized"))
 
-      idempotencyStore =
-        new DynamoDBIdempotencyStore[F](dynamoClient, config.dynamodb)
-
-      // 5. Create event publisher
-      eventPublisher: EventPublisher[F] =
-        if config.kinesis.enabled then
-          new KinesisPublisher[F](kinesisClient, config.kinesis)
-        else EventPublisher.noop[F]
-
-      _ <- Resource
-        .eval(logger.info(s"Event publishing enabled: ${config.kinesis.enabled}"))
-
-      // 6. Create routes
-      routes =
-        new Routes[F](rateLimitStore, idempotencyStore, eventPublisher, config)
-
-      // 7. Parse host/port
-      host <- Resource.eval(Async[F].fromOption(
-        Host.fromString(config.server.host),
-        new IllegalArgumentException(s"Invalid host: ${config.server.host}"),
-      ))
-
-      port <- Resource.eval(Async[F].fromOption(
-        Port.fromInt(config.server.port),
-        new IllegalArgumentException(s"Invalid port: ${config.server.port}"),
-      ))
-
-      // 8. Start HTTP server
-      _ <- EmberServerBuilder.default[F].withHost(host).withPort(port)
+      // Start server
+      server <- EmberServerBuilder
+        .default[IO]
+        .withHost(Host.fromString(config.server.host).getOrElse(host"0.0.0.0"))
+        .withPort(Port.fromInt(config.server.port).getOrElse(port"8080"))
         .withHttpApp(routes.httpApp)
-        .withShutdownTimeout(scala.concurrent.duration.Duration(30, "s")).build
-        .evalTap(_ =>
-          logger.info(s"Server started on http://${config.server.host}:${config
-              .server.port}"),
-        )
-    yield ()
+        .withShutdownTimeout(config.server.shutdownTimeout)
+        .build
+      
+      _ <- Resource.eval(logger.info(s"Server started on ${config.server.host}:${config.server.port}"))
+    yield server
