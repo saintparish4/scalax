@@ -1,4 +1,4 @@
-package com.ratelimiter.api
+package api
 
 import java.time.Instant
 
@@ -7,7 +7,8 @@ import org.http4s.circe.*
 import org.http4s.circe.CirceEntityDecoder.*
 import org.http4s.circe.CirceEntityEncoder.*
 import org.http4s.dsl.Http4sDsl
-import org.http4s.server.{AuthMiddleware, AuthedRoutes, Router}
+import org.http4s.server.{AuthMiddleware, Router}
+import org.http4s.AuthedRoutes
 import org.typelevel.log4cats.Logger
 
 import cats.effect.*
@@ -16,7 +17,7 @@ import io.circe.generic.auto.*
 import io.circe.syntax.*
 import core.*
 import events.*
-import metrics.*
+import _root_.metrics.MetricsPublisher
 import security.*
 import config.RateLimitConfig
 

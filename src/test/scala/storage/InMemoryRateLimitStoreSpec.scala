@@ -4,7 +4,6 @@ import org.scalatest.freespec.AsyncFreeSpec
 import org.scalatest.matchers.should.Matchers
 
 import core.{RateLimitDecision, RateLimitProfile}
-
 import cats.effect.IO
 import cats.effect.testing.scalatest.AsyncIOSpec
 import cats.syntax.all.*
@@ -26,8 +25,8 @@ class InMemoryRateLimitStoreSpec
 
       test.asserting { (decision: RateLimitDecision) =>
         decision.shouldBe(a[RateLimitDecision.Allowed])
-        decision.asInstanceOf[RateLimitDecision.Allowed]
-          .tokensRemaining.shouldBe(9)
+        decision.asInstanceOf[RateLimitDecision.Allowed].tokensRemaining
+          .shouldBe(9)
       }
     }
 
@@ -43,7 +42,9 @@ class InMemoryRateLimitStoreSpec
           decision <- store.checkAndConsume("test-key", cost = 1, testProfile)
         yield decision
 
-      test.asserting((decision: RateLimitDecision) => decision.shouldBe(a[RateLimitDecision.Rejected]))
+      test.asserting((decision: RateLimitDecision) =>
+        decision.shouldBe(a[RateLimitDecision.Rejected]),
+      )
     }
 
     "should handle cost > 1" in {
@@ -55,8 +56,8 @@ class InMemoryRateLimitStoreSpec
 
       test.asserting { (decision: RateLimitDecision) =>
         decision.shouldBe(a[RateLimitDecision.Allowed])
-        decision.asInstanceOf[RateLimitDecision.Allowed]
-          .tokensRemaining.shouldBe(5)
+        decision.asInstanceOf[RateLimitDecision.Allowed].tokensRemaining
+          .shouldBe(5)
       }
     }
 
@@ -69,7 +70,9 @@ class InMemoryRateLimitStoreSpec
           decision <- store.checkAndConsume("test-key", cost = 5, testProfile)
         yield decision
 
-      test.asserting((decision: RateLimitDecision) => decision.shouldBe(a[RateLimitDecision.Rejected]))
+      test.asserting((decision: RateLimitDecision) =>
+        decision.shouldBe(a[RateLimitDecision.Rejected]),
+      )
     }
 
     "should track different keys independently" in {
@@ -83,8 +86,8 @@ class InMemoryRateLimitStoreSpec
 
       test.asserting { (decision: RateLimitDecision) =>
         decision.shouldBe(a[RateLimitDecision.Allowed])
-        decision.asInstanceOf[RateLimitDecision.Allowed]
-          .tokensRemaining.shouldBe(9)
+        decision.asInstanceOf[RateLimitDecision.Allowed].tokensRemaining
+          .shouldBe(9)
       }
     }
 
@@ -98,7 +101,8 @@ class InMemoryRateLimitStoreSpec
 
       test.asserting { status =>
         status.shouldBe(defined)
-        status.get.tokensInt.shouldBe(7)
+        status.get shouldBe a[RateLimitDecision.Allowed]
+        status.get.tokensRemaining shouldBe 7
       }
     }
 

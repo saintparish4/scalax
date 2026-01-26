@@ -7,6 +7,7 @@ import org.http4s.dsl.io.*
 import org.http4s.headers.Authorization
 import org.http4s.server.AuthMiddleware
 import org.typelevel.log4cats.Logger
+import org.typelevel.ci.*
 
 import cats.data.{Kleisli, OptionT}
 import cats.effect.*
@@ -24,6 +25,7 @@ import cats.syntax.all.*
   */
 case class AuthenticatedClient(
     apiKeyId: String,
+    clientId: String,
     clientName: String,
     tier: ClientTier,
     permissions: Set[Permission],
@@ -100,18 +102,21 @@ object ApiKeyStore:
   val testKeys: Map[String, AuthenticatedClient] = Map(
     "test-api-key" -> AuthenticatedClient(
       apiKeyId = "key_test_001",
+      clientId = "client_test_001",
       clientName = "Test Client",
       tier = ClientTier.Premium,
       permissions = Permission.standard,
     ),
     "admin-api-key" -> AuthenticatedClient(
       apiKeyId = "key_admin_001",
+      clientId = "client_admin_001",
       clientName = "Admin Client",
       tier = ClientTier.Enterprise,
       permissions = Permission.admin,
     ),
     "free-api-key" -> AuthenticatedClient(
       apiKeyId = "key_free_001",
+      clientId = "client_free_001",
       clientName = "Free Tier Client",
       tier = ClientTier.Free,
       permissions = Permission.standard,
@@ -148,7 +153,7 @@ object ApiKeyAuth:
   ): AuthMiddleware[F, AuthenticatedClient] =
     val logger = Logger[F]
 
-    val authUser: Kleisli[OptionT[F, *], Request[F], AuthenticatedClient] =
+    val authUser: Kleisli[[X] =>> OptionT[F, X], Request[F], AuthenticatedClient] =
       Kleisli { request =>
         OptionT {
           extractApiKey(request).flatMap {
@@ -209,7 +214,7 @@ object ApiKeyAuth:
     */
   def requirePermission[F[_]: Temporal](
       permission: Permission,
-  ): Kleisli[OptionT[F, *], AuthenticatedClient, AuthenticatedClient] = Kleisli(
+  ): Kleisli[[X] =>> OptionT[F, X], AuthenticatedClient, AuthenticatedClient] = Kleisli(
     client =>
       OptionT(
         if client.permissions.contains(permission) then
@@ -232,17 +237,17 @@ object AuthRateLimiter:
 
   /** Simple in-memory rate limiter for auth attempts.
     */
-  def inMemory[F[_]: Temporal](
+  def inMemory[F[_]: Temporal: Sync](
       maxRequestsPerMinute: Int = 100,
       maxFailedAttemptsPerMinute: Int = 10,
-  ): F[AuthRateLimiter[F]] = Temporal[F].delay {
+  ): F[AuthRateLimiter[F]] = Sync[F].delay {
     // Cache for tracking request counts per client
     val requestCounts = Caffeine.newBuilder()
       .expireAfterWrite(java.time.Duration.ofMinutes(1))
       .build[String, AtomicInteger]()
 
     new AuthRateLimiter[F]:
-      override def checkLimit(clientId: String): F[Boolean] = Temporal[F]
+      override def checkLimit(clientId: String): F[Boolean] = Sync[F]
         .delay {
           val counter = requestCounts.get(clientId, _ => new AtomicInteger(0))
           val count = counter.incrementAndGet()

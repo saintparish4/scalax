@@ -5,6 +5,7 @@ import scala.concurrent.duration.*
 import org.typelevel.log4cats.Logger
 
 import cats.effect.*
+import cats.effect.syntax.monadCancel.*
 import cats.syntax.all.*
 
 /** Graceful degradation strategies for when dependencies fail.
@@ -78,8 +79,8 @@ object GracefulDegradation:
   def degradedDecision[F[_]: Temporal](
       mode: DegradationMode,
       key: String,
-  ): F[com.ratelimiter.core.RateLimitDecision] =
-    import com.ratelimiter.core.RateLimitDecision.*
+  ): F[core.RateLimitDecision] =
+    import core.RateLimitDecision.*
 
     Clock[F].realTime.map { now =>
       val resetAt = java.time.Instant.ofEpochMilli(now.toMillis + 60000)

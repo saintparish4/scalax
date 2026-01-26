@@ -1,5 +1,3 @@
-package com.ratelimiter
-
 import cats.effect.*
 import cats.syntax.all.*
 import com.comcast.ip4s.*
@@ -8,15 +6,14 @@ import org.http4s.server.Server
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 import org.typelevel.log4cats.Logger
 
-import com.ratelimiter.api.Routes
-import com.ratelimiter.config.AppConfig
-import com.ratelimiter.core.*
-import com.ratelimiter.events.*
-import com.ratelimiter.metrics.*
-import com.ratelimiter.resilience.*
-import com.ratelimiter.security.*
-import com.ratelimiter.storage.*
-import security.SecretsConfig
+import api.Routes
+import config.*
+import core.*
+import events.*
+import _root_.metrics.MetricsPublisher
+import resilience.*
+import security.*
+import storage.*
 
 import scala.concurrent.duration.*
 
@@ -48,12 +45,7 @@ object Main extends IOApp:
           for
             kinesisClient <- AwsClients.kinesisClient[IO](config.aws)
             kinesisPublisher = new KinesisPublisher[IO](kinesisClient, config.kinesis)
-            buffered <- EventPublisher.buffered[IO](
-              kinesisPublisher, 
-              config.kinesis.batchSize,
-              config.kinesis.flushInterval
-            )
-          yield buffered
+          yield kinesisPublisher
         case false => 
           Resource.pure[IO, EventPublisher[IO]](EventPublisher.noop[IO])
       _ <- Resource.eval(logger.info("Event publisher initialized"))
@@ -67,7 +59,7 @@ object Main extends IOApp:
           // Use DynamoDB for production
           for
             dynamoClient <- AwsClients.dynamoDbClient[IO](config.aws)
-            store = new DynamoDBRateLimitStore[IO](dynamoClient, config.dynamodb, maxRetries = 5)
+            store = new DynamoDBRateLimitStore[IO](dynamoClient, config.dynamodb.rateLimitTable)
           yield store
       _ <- Resource.eval(logger.info("Rate limit store initialized"))
 
@@ -78,7 +70,7 @@ object Main extends IOApp:
         case false =>
           for
             dynamoClient <- AwsClients.dynamoDbClient[IO](config.aws)
-            store = new DynamoDBIdempotencyStore[IO](dynamoClient, config.dynamodb)
+            store = new DynamoDBIdempotencyStore[IO](dynamoClient, config.dynamodb.idempotencyTable)
           yield store
       _ <- Resource.eval(logger.info("Idempotency store initialized"))
 
@@ -110,11 +102,14 @@ object Main extends IOApp:
       authMiddleware = ApiKeyAuth.middleware[IO](apiKeyStore, Some(authRateLimiter))
 
       // Create HTTP routes
-      routes = new Routes[IO](
+      routes = Routes[IO](
         rateLimitStore,
         idempotencyStore,
         eventPublisher,
-        config
+        metricsPublisher,
+        authMiddleware,
+        config.rateLimit,
+        logger
       )
       _ <- Resource.eval(logger.info("HTTP routes initialized"))
 

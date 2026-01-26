@@ -6,7 +6,7 @@ import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.auth.credentials.*
 import java.net.URI
 
-import com.ratelimiter.config.AwsConfig
+import config.AwsConfig
 
 /**
  * Factory for creating DynamoDB async clients with proper resource management.

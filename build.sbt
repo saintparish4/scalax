@@ -22,9 +22,13 @@ libraryDependencies ++= Seq(
   "software.amazon.awssdk" % "dynamodb" % AwsSdkVersion,
   "software.amazon.awssdk" % "kinesis" % AwsSdkVersion,
   "software.amazon.awssdk" % "cloudwatch" % AwsSdkVersion,
+  "software.amazon.awssdk" % "secretsmanager" % AwsSdkVersion,
   
   // Config
   "com.github.pureconfig" %% "pureconfig-core" % "0.17.9",
+  
+  // Caching
+  "com.github.ben-manes.caffeine" % "caffeine" % "3.1.8",
   
   // Logging
   "ch.qos.logback" % "logback-classic" % "1.5.19",

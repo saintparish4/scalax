@@ -1,6 +1,7 @@
 package api 
 
 import cats.effect.*
+import cats.effect.syntax.spawn.*
 import cats.syntax.all.*
 import org.http4s.*
 import org.http4s.dsl.Http4sDsl
@@ -15,7 +16,7 @@ import java.time.Instant
 
 import core.*
 import events.*
-import metrics.*
+import _root_.metrics.MetricsPublisher
 import security.*
 import config.RateLimitConfig 
 
@@ -41,7 +42,7 @@ class RateLimitApi[F[_]: Async](
       checkReq <- request.as[RateLimitCheckRequest]
       
       // Get profile for this client tier
-      profile = getProfile(client.tier, checkReq.profile)
+      profile <- Async[F].pure(getProfile(client.tier, checkReq.profile))
       
       // Perform rate limit check
       _ <- logger.debug(s"Rate limit check: key=${checkReq.key}, cost=${checkReq.cost}, tier=${client.tier}")
@@ -70,19 +71,19 @@ class RateLimitApi[F[_]: Async](
    * Get current rate limit status for a key.
    */
   def status(key: String, client: AuthenticatedClient): F[Response[F]] =
+    val profile = getProfile(client.tier, None)
     for
-      profile = getProfile(client.tier, None)
       maybeStatus <- store.getStatus(key, profile)
+      nowMs <- Clock[F].realTime.map(_.toMillis)
       response <- maybeStatus match
         case Some(state) =>
           // Calculate reset time based on current state
-          nowMs <- Clock[F].realTime.map(_.toMillis)
           val resetAt = Instant.ofEpochMilli(nowMs).plusSeconds(
-            ((profile.capacity - state.tokens) / profile.refillRatePerSecond).ceil.toLong
+            ((profile.capacity - state.tokensRemaining) / profile.refillRatePerSecond).ceil.toLong
           )
           Ok(RateLimitStatusResponse(
             key = key,
-            tokensRemaining = state.tokensInt,
+            tokensRemaining = state.tokensRemaining,
             limit = profile.capacity,
             resetAt = resetAt.toString
           ).asJson)
@@ -144,21 +145,23 @@ class RateLimitApi[F[_]: Async](
     val event = decision match
       case RateLimitDecision.Allowed(tokensRemaining, _) =>
         RateLimitEvent.Allowed(
-          timestamp = timestamp.toEpochMilli,
+          timestamp = timestamp,
           apiKey = client.apiKeyId,
-          requestKey = request.key,
-          endpoint = request.endpoint,
+          clientId = client.clientId,
+          endpoint = request.endpoint.getOrElse("unknown"),
           tokensRemaining = tokensRemaining,
           cost = request.cost,
+          tier = client.tier.toString
         )
       case RateLimitDecision.Rejected(retryAfter, _) =>
         RateLimitEvent.Rejected(
-          timestamp = timestamp.toEpochMilli,
+          timestamp = timestamp,
           apiKey = client.apiKeyId,
-          requestKey = request.key,
-          endpoint = request.endpoint,
+          clientId = client.clientId,
+          endpoint = request.endpoint.getOrElse("unknown"),
           retryAfterSeconds = retryAfter,
           reason = "Rate limit exceeded",
+          tier = client.tier.toString
         )
     
     eventPublisher.publish(event).handleError { error =>

@@ -160,7 +160,7 @@ private class CaffeineCache[F[_]: Sync, K <: AnyRef, V <: AnyRef](
   * for scenarios where eventual consistency is acceptable.
   */
 object CachedRateLimitStore:
-  import com.ratelimiter.core.{
+  import core.{
     RateLimitDecision, RateLimitProfile, RateLimitStore,
   }
 
@@ -178,7 +178,7 @@ object CachedRateLimitStore:
     * Note: The checkAndConsume operation is NOT cached - it always goes to the
     * underlying store for atomicity. Only getStatus is cached.
     */
-  def wrap[F[_]: Temporal: Logger](
+  def wrap[F[_]: Async: Logger](
       underlying: RateLimitStore[F],
       cacheConfig: LocalCacheConfig = LocalCacheConfig.default,
   ): Resource[F, RateLimitStore[F]] = LocalCache
@@ -200,7 +200,7 @@ object CachedRateLimitStore:
                   .realTime.map(_.toMillis).flatMap(now =>
                     cache.put(key, CachedBucketState(tokens, resetAt, now)),
                   )
-              case _ => Temporal[F].unit,
+              case _ => Async[F].unit,
           )
 
         override def getStatus(
@@ -210,7 +210,7 @@ object CachedRateLimitStore:
           case Some(cached) => Clock[F].realTime.map(_.toMillis).flatMap(now =>
               // Check if cache is still valid
               if now - cached.cachedAt < cacheConfig.ttl.toMillis then
-                logger.debug(s"Cache hit for key: $key") *> Temporal[F].pure(
+                logger.debug(s"Cache hit for key: $key") *> Async[F].pure(
                   Some(RateLimitDecision.Allowed(cached.tokens, cached.resetAt)),
                 )
               else
@@ -234,6 +234,6 @@ object CachedRateLimitStore:
                   CachedBucketState(status.tokensRemaining, status.resetAt, now),
                 ),
               )
-            case None => Temporal[F].unit
+            case None => Async[F].unit
           }
     }

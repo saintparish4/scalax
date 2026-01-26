@@ -1,6 +1,7 @@
 package config
 
 import cats.effect.Sync
+import cats.syntax.all.*
 import pureconfig.*
 import pureconfig.generic.derivation.default.*
 import scala.concurrent.duration.FiniteDuration
@@ -58,11 +59,62 @@ case class SecurityConfig(
     secrets: SecretsConfig
 ) derives ConfigReader
 
+// Rate limiting profile
+case class RateLimitProfileConfig(
+    capacity: Int,
+    refillRatePerSecond: Double,
+    ttlSeconds: Long
+) derives ConfigReader
+
 // Rate limiting defaults
 case class RateLimitConfig(
     defaultCapacity: Int,
     defaultRefillRatePerSecond: Double,
     defaultTtlSeconds: Long,
+    profiles: Map[String, RateLimitProfileConfig] = Map.empty
+) derives ConfigReader
+
+// Resilience configuration
+case class CircuitBreakerConfig(
+    maxFailures: Int = 5,
+    resetTimeout: FiniteDuration = scala.concurrent.duration.Duration(30, "seconds"),
+    halfOpenMaxCalls: Int = 3
+) derives ConfigReader
+
+case class CircuitBreakerSettings(
+    enabled: Boolean = true,
+    dynamodb: CircuitBreakerConfig = CircuitBreakerConfig(),
+    kinesis: CircuitBreakerConfig = CircuitBreakerConfig()
+) derives ConfigReader
+
+case class RetryConfig(
+    maxRetries: Int = 3,
+    baseDelay: FiniteDuration = scala.concurrent.duration.Duration(100, "millis"),
+    maxDelay: FiniteDuration = scala.concurrent.duration.Duration(10, "seconds"),
+    multiplier: Double = 2.0
+) derives ConfigReader
+
+case class RetrySettings(
+    dynamodb: RetryConfig = RetryConfig(),
+    kinesis: RetryConfig = RetryConfig()
+) derives ConfigReader
+
+case class BulkheadSettings(
+    enabled: Boolean = true,
+    maxConcurrent: Int = 25,
+    maxWait: FiniteDuration = scala.concurrent.duration.Duration(100, "millis")
+) derives ConfigReader
+
+case class TimeoutSettings(
+    rateLimitCheck: FiniteDuration = scala.concurrent.duration.Duration(500, "millis"),
+    healthCheck: FiniteDuration = scala.concurrent.duration.Duration(5, "seconds")
+) derives ConfigReader
+
+case class ResilienceConfig(
+    circuitBreaker: CircuitBreakerSettings = CircuitBreakerSettings(),
+    retry: RetrySettings = RetrySettings(),
+    bulkhead: BulkheadSettings = BulkheadSettings(),
+    timeout: TimeoutSettings = TimeoutSettings()
 ) derives ConfigReader
 
 // Root application configuration

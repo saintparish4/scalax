@@ -2,12 +2,13 @@ package resilience
 
 import cats.effect.*
 import cats.syntax.all.*
-import com.ratelimiter.config.ResilienceConfig
-import com.ratelimiter.core.{RateLimitDecision, RateLimitProfile, RateLimitStore}
-import com.ratelimiter.events.{EventPublisher, RateLimitEvent}
-import com.ratelimiter.metrics.MetricsPublisher
+import config.{ResilienceConfig, CircuitBreakerSettings, RetryConfig, RetrySettings, BulkheadSettings, TimeoutSettings}
+import resilience.CircuitBreakerConfig
+import core.{RateLimitDecision, RateLimitProfile, RateLimitStore}
+import events.{EventPublisher, RateLimitEvent}
+import _root_.metrics.MetricsPublisher
 import org.typelevel.log4cats.Logger
-import scala.concurrent.duration.
+import scala.concurrent.duration.*
 
 /**
  * Resilient wrapper that applies production hardening patterns to the rate limit store.
@@ -38,7 +39,7 @@ object ResilientRateLimitStore:
         if config.circuitBreaker.enabled then
           CircuitBreaker[F](
             "dynamodb-ratelimit",
-            CircuitBreakerConfig(
+            resilience.CircuitBreakerConfig(
               maxFailures = config.circuitBreaker.dynamodb.maxFailures,
               resetTimeout = config.circuitBreaker.dynamodb.resetTimeout,
               halfOpenMaxCalls = config.circuitBreaker.dynamodb.halfOpenMaxCalls
@@ -88,10 +89,10 @@ object ResilientRateLimitStore:
         }
         
         // Apply patterns in order: bulkhead -> circuit breaker -> retry -> timeout
-        val protected = applyPatterns(operation, "checkAndConsume")
+        val wrappedOp = applyPatterns(operation, "checkAndConsume")
         
         // Handle failures with graceful degradation
-        protected
+        wrappedOp
           .flatTap(decision => recordDecision(key, decision))
           .flatTap(_ => healthTracker.recordSuccess)
           .handleErrorWith { error =>
@@ -126,20 +127,20 @@ object ResilientRateLimitStore:
       
       private def applyPatterns[A](operation: F[A], name: String): F[A] =
         // Start with the base operation
-        var protected = operation
+        var wrappedOp = operation
         
         // Apply timeout
-        protected = Temporal[F].timeout(protected, config.timeout.rateLimitCheck)
+        wrappedOp = Temporal[F].timeout(wrappedOp, config.timeout.rateLimitCheck)
           .adaptError { case _: java.util.concurrent.TimeoutException =>
             new RuntimeException(s"Operation $name timed out after ${config.timeout.rateLimitCheck}")
           }
         
         // Apply retry
-        protected = Retry.withPolicy(retryPolicy, name)(protected)
+        wrappedOp = Retry.withPolicy(retryPolicy, name)(wrappedOp)
         
         // Apply circuit breaker
         circuitBreaker.foreach { cb =>
-          protected = cb.protect(protected).flatTap { _ =>
+          wrappedOp = cb.protect(wrappedOp).flatTap { _ =>
             cb.metrics.flatMap { m =>
               metrics.recordCircuitBreakerState("dynamodb-ratelimit", m.state.toString, m.failureCount)
             }
@@ -148,10 +149,10 @@ object ResilientRateLimitStore:
         
         // Apply bulkhead
         bulkhead.foreach { bh =>
-          protected = bh.execute(protected)
+          wrappedOp = bh.execute(wrappedOp)
         }
         
-        protected
+        wrappedOp
       
       private def handleDegradation(
           key: String,
@@ -196,7 +197,7 @@ object ResilientRateLimitStore:
 /**
  * Builder for creating resilient stores with fluent API.
  */
-class ResilientStoreBuilder[F[_]: Temporal: Logger](
+class ResilientStoreBuilder[F[_]: Async: Logger](
     underlying: RateLimitStore[F]
 ):
   private var _config: Option[ResilienceConfig] = None
@@ -227,7 +228,7 @@ class ResilientStoreBuilder[F[_]: Temporal: Logger](
     for
       metrics <- _metrics match
         case Some(m) => Resource.pure[F, MetricsPublisher[F]](m)
-        case None => Resource.eval(MetricsPublisher.noop[F])
+        case None => Resource.pure[F, MetricsPublisher[F]](MetricsPublisher.noop[F])
       
       events <- _events match
         case Some(e) => Resource.pure[F, EventPublisher[F]](e)
@@ -237,12 +238,12 @@ class ResilientStoreBuilder[F[_]: Temporal: Logger](
     yield store
   
   private def defaultConfig: ResilienceConfig =
-    import com.ratelimiter.config.*
+    import config.*
     ResilienceConfig(
       circuitBreaker = CircuitBreakerSettings(
         enabled = true,
-        dynamodb = CircuitBreakerConfig(),
-        kinesis = CircuitBreakerConfig()
+        dynamodb = config.CircuitBreakerConfig(),
+        kinesis = config.CircuitBreakerConfig()
       ),
       retry = RetrySettings(
         dynamodb = RetryConfig(),
@@ -253,5 +254,5 @@ class ResilientStoreBuilder[F[_]: Temporal: Logger](
     )
 
 object ResilientStoreBuilder:
-  def apply[F[_]: Temporal: Logger](store: RateLimitStore[F]): ResilientStoreBuilder[F] =
+  def apply[F[_]: Async: Logger](store: RateLimitStore[F]): ResilientStoreBuilder[F] =
     new ResilientStoreBuilder[F](store)

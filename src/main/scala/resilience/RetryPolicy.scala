@@ -37,11 +37,11 @@ case class RetryPolicy(
   require(maxRetries >= 0, "maxRetries must be non-negative")
   require(baseDelay > Duration.Zero, "baseDelay must be positive")
   require(maxDelay >= baseDelay, "maxDelay must be >= baseDelay")
-require(multiplier >= 1.0, "multiplier must be >= 1.0")
-require(
-  jitterFactor >= 0.0 && jitterFactor <= 1.0,
-  "jitterFactor must be in [0.0, 1.0]",
-)
+  require(multiplier >= 1.0, "multiplier must be >= 1.0")
+  require(
+    jitterFactor >= 0.0 && jitterFactor <= 1.0,
+    "jitterFactor must be in [0.0, 1.0]",
+  )
 
 object RetryPolicy:
   /** Default policy for transient failures */
@@ -163,14 +163,17 @@ object Retry:
     val cappedDelay = exponentialDelay.min(policy.maxDelay)
 
     // Add jitter
-    val jitter =
+    val jitter: FiniteDuration =
       if policy.jitterFactor > 0 then
         val jitterRange = cappedDelay.toMillis * policy.jitterFactor
         val randomJitter = (Random.nextDouble() * 2 - 1) * jitterRange
         randomJitter.millis
-      else Duration.Zero
+      else 0.millis
 
-    (cappedDelay + jitter).max(Duration.Zero)
+    val result = cappedDelay + jitter
+    result match
+      case fd: FiniteDuration => fd
+      case _ => 0.millis
 
   /** Convenience method for simple retries without custom policy.
     */

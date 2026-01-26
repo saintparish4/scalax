@@ -10,12 +10,13 @@ import org.http4s.dsl.Http4sDsl
 import org.typelevel.log4cats.Logger
 
 import cats.effect.*
+import cats.effect.syntax.spawn.*
 import cats.syntax.all.*
 import io.circe.generic.auto.*
 import io.circe.syntax.*
 import core.*
 import events.*
-import metrics.*
+import _root_.metrics.MetricsPublisher
 import security.*
 
 /** Idempotency API endpoints.
@@ -153,21 +154,21 @@ class IdempotencyApi[F[_]: Async](
   ): F[Unit] =
     val event = result match
       case IdempotencyResult.New(key, _) => RateLimitEvent.IdempotencyNew(
-          timestamp = timestamp.toEpochMilli,
+          timestamp = timestamp,
           idempotencyKey = key,
           clientId = client.apiKeyId,
           ttlSeconds = ttlSeconds,
         )
       case IdempotencyResult.Duplicate(key, _, firstSeenAt) => RateLimitEvent
           .IdempotencyHit(
-            timestamp = timestamp.toEpochMilli,
+            timestamp = timestamp,
             idempotencyKey = key,
             clientId = client.apiKeyId,
             originalRequestTime = firstSeenAt,
           )
       case IdempotencyResult.InProgress(key, startedAt) => RateLimitEvent
           .IdempotencyHit(
-            timestamp = timestamp.toEpochMilli,
+            timestamp = timestamp,
             idempotencyKey = key,
             clientId = client.apiKeyId,
             originalRequestTime = startedAt,

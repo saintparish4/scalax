@@ -1,13 +1,13 @@
 package metrics
 
 import cats.effect.*
+import cats.effect.syntax.spawn.*
 import cats.syntax.all.*
 import org.typelevel.log4cats.Logger
 import software.amazon.awssdk.services.cloudwatch.CloudWatchAsyncClient
 import software.amazon.awssdk.services.cloudwatch.model.*
 import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
-import scala.jdk.FutureConverters.*
 import java.time.Instant
 
 
@@ -202,7 +202,7 @@ object MetricsPublisher:
     (Async[F].sleep(config.flushInterval) *>
       doFlush(bufferRef, lastFlushRef, client, config, logger)).foreverM
 
-  private def doFlush[F[_]: Async](
+  def doFlush[F[_]: Async](
       bufferRef: Ref[F, List[MetricDataPoint]],
       lastFlushRef: Ref[F, Long],
       client: CloudWatchAsyncClient,
@@ -248,7 +248,7 @@ object MetricsPublisher:
         .metricData(batch.asJava).build()
 
       Async[F].fromCompletableFuture(
-        Async[F].delay(client.putMetricData(request).asScala.toCompletableFuture),
+        Async[F].delay(client.putMetricData(request)),
       ).void.handleErrorWith(error =>
         logger.error(error)("Failed to publish metrics to CloudWatch"),
       )

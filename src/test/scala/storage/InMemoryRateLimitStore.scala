@@ -51,7 +51,7 @@ class InMemoryRateLimitStore[F[_]: Sync](
       }
     yield decision
 
-  override def getStatus(key: String, profile: RateLimitProfile): F[Option[TokenBucketState]] =
+  override def getStatus(key: String, profile: RateLimitProfile): F[Option[RateLimitDecision.Allowed]] =
     for
       nowMs <- Clock[F].realTime.map(_.toMillis)
       stateMap <- stateRef.get
@@ -59,7 +59,13 @@ class InMemoryRateLimitStore[F[_]: Sync](
       val elapsedMs = nowMs - state.lastRefillEpochMs
       val tokensToAdd = (elapsedMs / 1000.0) * profile.refillRatePerSecond
       val refilledTokens = math.min(profile.capacity.toDouble, state.tokens + tokensToAdd)
-      state.copy(tokens = refilledTokens, lastRefillEpochMs = nowMs)
+      
+      // Calculate reset time
+      val tokensToFull = profile.capacity - refilledTokens
+      val secondsToFull = (tokensToFull / profile.refillRatePerSecond).ceil.toLong
+      val resetAt = Instant.ofEpochMilli(nowMs).plusSeconds(secondsToFull)
+      
+      RateLimitDecision.Allowed(refilledTokens.toInt, resetAt)
     }
 
   override def healthCheck: F[Boolean] = Sync[F].pure(true)

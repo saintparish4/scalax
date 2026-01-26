@@ -4,6 +4,7 @@ import cats.effect.*
 import cats.syntax.all.*
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
 import software.amazon.awssdk.services.dynamodb.model.*
+import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
 import scala.jdk.FutureConverters.*
 import java.time.Instant 
@@ -28,7 +29,7 @@ class DynamoDBRateLimitStore[F[_]: Async](
     tableName: String
 ) extends RateLimitStore[F]:
 
-  private val MaxRetries = 3
+  private val MaxRetries = 10
 
   override def checkAndConsume(
       key: String,
@@ -64,9 +65,10 @@ class DynamoDBRateLimitStore[F[_]: Async](
             val resetAt = calculateResetAt(now, newTokens, profile)
             Async[F].pure(RateLimitDecision.Allowed(newTokens.toInt, resetAt))
           case false =>
-            // OCC conflict - retry
+            // OCC conflict - retry with small delay to reduce contention
             if retriesRemaining > 0 then
-              checkAndConsumeWithRetry(key, cost, profile, retriesRemaining - 1)
+              Async[F].sleep(1.millis) *>
+                checkAndConsumeWithRetry(key, cost, profile, retriesRemaining - 1)
             else
               // Give up, reject to be safe
               val resetAt = calculateResetAt(now, refilledTokens, profile)

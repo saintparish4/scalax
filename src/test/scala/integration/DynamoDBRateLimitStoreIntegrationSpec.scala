@@ -27,15 +27,14 @@ class DynamoDBRateLimitStoreIntegrationSpec
   // Create logger for tests
   implicit val logger: Logger[IO] = Slf4jLogger.getLogger[IO]
 
-  // Test profile
+  // Test profile - use minimal refill rate to avoid refill during test execution
   val testProfile: RateLimitProfile =
-    RateLimitProfile(capacity = 10, refillRatePerSecond = 1.0, ttlSeconds = 3600)
+    RateLimitProfile(capacity = 10, refillRatePerSecond = 0.00001, ttlSeconds = 3600)
 
   // Create store instance
   lazy val store: DynamoDBRateLimitStore[IO] = new DynamoDBRateLimitStore[IO](
     dynamoDbClient,
-    testDynamoDBConfig,
-    maxRetries = 5,
+    testDynamoDBConfig.rateLimitTable
   )
 
   override protected def beforeEach(): Unit = {
@@ -160,7 +159,7 @@ class DynamoDBRateLimitStoreIntegrationSpec
 
       test.asserting { status =>
         status shouldBe defined
-        status.get.tokensInt shouldBe 6 // 10 - 4
+        status.get.tokensRemaining shouldBe 6 // 10 - 4
       }
     }
 

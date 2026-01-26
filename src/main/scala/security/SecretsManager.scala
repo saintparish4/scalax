@@ -73,7 +73,7 @@ object SecretsManagerStore:
   /** Create a Secrets Manager client as a Resource.
     */
   def clientResource[F[_]: Async](
-      config: com.ratelimiter.config.AwsConfig,
+      awsConfig: _root_.config.AwsConfig,
   ): Resource[F, SecretsManagerAsyncClient] =
     import software.amazon.awssdk.regions.Region
     import software.amazon.awssdk.auth.credentials.*
@@ -81,10 +81,10 @@ object SecretsManagerStore:
 
     Resource.make(Async[F].delay {
       val builder = SecretsManagerAsyncClient.builder()
-        .region(Region.of(config.region))
+        .region(Region.of(awsConfig.region))
 
-      if config.endpoint.nonEmpty then
-        builder.endpointOverride(URI.create(config.endpoint))
+      if awsConfig.endpoint.nonEmpty then
+        builder.endpointOverride(URI.create(awsConfig.endpoint))
           .credentialsProvider(StaticCredentialsProvider.create(
             AwsBasicCredentials.create("test", "test"),
           ))
@@ -134,6 +134,7 @@ object SecretsManagerStore:
               ClientTier.fromString(cfg.tier).map(tier =>
                 cfg.apiKey -> AuthenticatedClient(
                   apiKeyId = cfg.apiKeyId,
+                  clientId = cfg.apiKeyId,
                   clientName = cfg.clientName,
                   tier = tier,
                   permissions = cfg.permissions.flatMap(parsePermission).toSet,
@@ -153,7 +154,7 @@ object SecretsManagerStore:
         val request = GetSecretValueRequest.builder().secretId(fullName).build()
 
         Async[F].fromCompletableFuture(Async[F].delay(
-          client.getSecretValue(request).asScala.toCompletableFuture,
+          client.getSecretValue(request),
         )).flatMap { response =>
           val value = response.secretString()
           val versionId = Option(response.versionId())

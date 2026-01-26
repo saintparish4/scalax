@@ -6,12 +6,13 @@ import org.scalatest.matchers.should.Matchers
 import org.typelevel.log4cats.Logger
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
-import core.{CachedResponse, IdempotencyResult}
+import core.{StoredResponse, IdempotencyResult}
 import storage.DynamoDBIdempotencyStore
 
 import cats.effect.IO
 import cats.effect.testing.scalatest.AsyncIOSpec
 import cats.syntax.all.*
+import java.time.Instant
 
 /** Integration tests for DynamoDBIdempotencyStore.
   *
@@ -27,7 +28,7 @@ class DynamoDBIdempotencyStoreIntegrationSpec
   implicit val logger: Logger[IO] = Slf4jLogger.getLogger[IO]
 
   lazy val store: DynamoDBIdempotencyStore[IO] =
-    new DynamoDBIdempotencyStore[IO](dynamoDbClient, testDynamoDBConfig)
+    new DynamoDBIdempotencyStore[IO](dynamoDbClient, testDynamoDBConfig.idempotencyTable)
 
   override protected def beforeEach(): Unit = {
     super.beforeEach()
@@ -37,63 +38,53 @@ class DynamoDBIdempotencyStoreIntegrationSpec
   "DynamoDBIdempotencyStore" - {
 
     "should return New for first request" in
-      store.checkOrCreate("new-key-1", ttlSeconds = 3600).asserting { result =>
+      store.check("new-key-1", clientId = "client-1", ttlSeconds = 3600).asserting { result =>
         result shouldBe a[IdempotencyResult.New]
         result.asInstanceOf[IdempotencyResult.New].idempotencyKey shouldBe
           "new-key-1"
       }
 
-    "should return Duplicate for second request with same key" in {
+    "should return InProgress for second request with same key (before completion)" in {
       val test = for {
-        first <- store.checkOrCreate("dup-key", ttlSeconds = 3600)
-        second <- store.checkOrCreate("dup-key", ttlSeconds = 3600)
+        first <- store.check("dup-key", clientId = "client-1", ttlSeconds = 3600)
+        second <- store.check("dup-key", clientId = "client-1", ttlSeconds = 3600)
       } yield (first, second)
 
       test.asserting { case (first, second) =>
         first shouldBe a[IdempotencyResult.New]
-        second shouldBe a[IdempotencyResult.Duplicate]
-        second.asInstanceOf[IdempotencyResult.Duplicate].idempotencyKey shouldBe
+        second shouldBe a[IdempotencyResult.InProgress]
+        second.asInstanceOf[IdempotencyResult.InProgress].idempotencyKey shouldBe
           "dup-key"
       }
     }
 
-    "should return Duplicate without response when pending" in {
-      val test = for {
-        _ <- store.checkOrCreate("pending-key", ttlSeconds = 3600)
-        result <- store.checkOrCreate("pending-key", ttlSeconds = 3600)
-      } yield result
-
-      test.asserting { result =>
-        result shouldBe a[IdempotencyResult.Duplicate]
-        val dup = result.asInstanceOf[IdempotencyResult.Duplicate]
-        dup.cachedResponse shouldBe None // No response stored yet
-      }
-    }
-
-    "should store and return cached response" in {
-      val cachedResponse = CachedResponse(
+    "should return Duplicate after response is stored" in {
+      val now = Instant.now()
+      val storedResponse = StoredResponse(
         statusCode = 201,
         body = """{"id": "order-123", "status": "created"}""",
         headers = Map("X-Request-Id" -> "req-456"),
+        completedAt = now
       )
 
       val test = for {
         // First request - mark as new
-        _ <- store.checkOrCreate("response-key", ttlSeconds = 3600)
+        _ <- store.check("response-key", clientId = "client-1", ttlSeconds = 3600)
 
         // Store the response
-        _ <- store.storeResponse("response-key", cachedResponse)
+        success <- store.storeResponse("response-key", storedResponse)
 
         // Second request - should get cached response
-        result <- store.checkOrCreate("response-key", ttlSeconds = 3600)
-      } yield result
+        result <- store.check("response-key", clientId = "client-1", ttlSeconds = 3600)
+      } yield (success, result)
 
-      test.asserting { result =>
+      test.asserting { case (success, result) =>
+        success shouldBe true
         result shouldBe a[IdempotencyResult.Duplicate]
         val dup = result.asInstanceOf[IdempotencyResult.Duplicate]
-        dup.cachedResponse shouldBe defined
+        dup.originalResponse shouldBe defined
 
-        val response = dup.cachedResponse.get
+        val response = dup.originalResponse.get
         response.statusCode shouldBe 201
         response.body should include("order-123")
         response.headers should contain("X-Request-Id" -> "req-456")
@@ -105,25 +96,25 @@ class DynamoDBIdempotencyStoreIntegrationSpec
 
       val test = for {
         results <- (1 to concurrentRequests).toList.parTraverse(_ =>
-          store.checkOrCreate("concurrent-idem-key", ttlSeconds = 3600),
+          store.check("concurrent-idem-key", clientId = "client-1", ttlSeconds = 3600),
         )
 
         newCount = results.count(_.isInstanceOf[IdempotencyResult.New])
-        dupCount = results.count(_.isInstanceOf[IdempotencyResult.Duplicate])
-      } yield (newCount, dupCount)
+        inProgressCount = results.count(_.isInstanceOf[IdempotencyResult.InProgress])
+      } yield (newCount, inProgressCount)
 
-      test.asserting { case (newCount, dupCount) =>
-        // Exactly ONE should win (first-writer-wins)
+      test.asserting { case (newCount, inProgressCount) =>
+        // Exactly ONE should win (first-writer-wins), rest should see InProgress
         newCount shouldBe 1
-        dupCount shouldBe 9
+        inProgressCount shouldBe 9
       }
     }
 
     "should isolate different keys" in {
       val test = for {
-        r1 <- store.checkOrCreate("key-a", ttlSeconds = 3600)
-        r2 <- store.checkOrCreate("key-b", ttlSeconds = 3600)
-        r3 <- store.checkOrCreate("key-c", ttlSeconds = 3600)
+        r1 <- store.check("key-a", clientId = "client-1", ttlSeconds = 3600)
+        r2 <- store.check("key-b", clientId = "client-1", ttlSeconds = 3600)
+        r3 <- store.check("key-c", clientId = "client-1", ttlSeconds = 3600)
       } yield (r1, r2, r3)
 
       test.asserting { case (r1, r2, r3) =>
@@ -137,7 +128,8 @@ class DynamoDBIdempotencyStoreIntegrationSpec
       store.healthCheck.asserting(healthy => healthy shouldBe true)
 
     "should handle complex response bodies" in {
-      val complexResponse = CachedResponse(
+      val now = Instant.now()
+      val complexResponse = StoredResponse(
         statusCode = 200,
         body =
           """{
@@ -156,22 +148,42 @@ class DynamoDBIdempotencyStoreIntegrationSpec
         }""",
         headers =
           Map("Content-Type" -> "application/json", "X-Trace-Id" -> "trace-789"),
+        completedAt = now
       )
 
       val test = for {
-        _ <- store.checkOrCreate("complex-key", ttlSeconds = 3600)
+        _ <- store.check("complex-key", clientId = "client-1", ttlSeconds = 3600)
         _ <- store.storeResponse("complex-key", complexResponse)
-        result <- store.checkOrCreate("complex-key", ttlSeconds = 3600)
+        result <- store.check("complex-key", clientId = "client-1", ttlSeconds = 3600)
       } yield result
 
       test.asserting { result =>
         val dup = result.asInstanceOf[IdempotencyResult.Duplicate]
-        dup.cachedResponse shouldBe defined
+        dup.originalResponse shouldBe defined
 
-        val response = dup.cachedResponse.get
+        val response = dup.originalResponse.get
         response.body should include("Item 1")
         response.body should include("pagination")
         response.headers should have size 2
+      }
+    }
+
+    "should allow retry after marking as failed" in {
+      val test = for {
+        // First request
+        first <- store.check("retry-key", clientId = "client-1", ttlSeconds = 3600)
+        
+        // Mark as failed
+        marked <- store.markFailed("retry-key")
+        
+        // Should be able to retry
+        retry <- store.check("retry-key", clientId = "client-1", ttlSeconds = 3600)
+      } yield (first, marked, retry)
+
+      test.asserting { case (first, marked, retry) =>
+        first shouldBe a[IdempotencyResult.New]
+        marked shouldBe true
+        retry shouldBe a[IdempotencyResult.New] // Can retry after failure
       }
     }
   }
