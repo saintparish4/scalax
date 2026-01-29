@@ -1,24 +1,7 @@
-# =============================================================================
-# ECS Module
-# =============================================================================
-#
-# Creates:
-# - ECS Fargate cluster
-# - Task definition
-# - ECS service
-# - Application Load Balancer
-# - IAM roles (execution, task)
-# - Security groups
-# - CloudWatch log group
-# - Auto-scaling
-#
+# ECS Module - Creates Fargate cluster, ALB, IAM roles, security groups, and auto-scaling
 
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
-
-# -----------------------------------------------------------------------------
-# ECS Cluster
-# -----------------------------------------------------------------------------
 
 resource "aws_ecs_cluster" "main" {
   name = "${var.project_name}-${var.environment}"
@@ -33,28 +16,12 @@ resource "aws_ecs_cluster" "main" {
   }
 }
 
-resource "aws_ecs_cluster_capacity_providers" "main" {
-  cluster_name = aws_ecs_cluster.main.name
-
-  capacity_providers = ["FARGATE", "FARGATE_SPOT"]
-
-  default_capacity_provider_strategy {
-    base              = 1
-    weight            = 100
-    capacity_provider = "FARGATE"
-  }
-}
-
-# -----------------------------------------------------------------------------
-# CloudWatch Log Group
-# -----------------------------------------------------------------------------
-
 resource "aws_cloudwatch_log_group" "app" {
   name              = "/ecs/${var.project_name}-${var.environment}"
-  retention_in_days = 14
+  retention_in_days = var.environment == "prod" ? 30 : 7
 
   tags = {
-    Name = "${var.project_name}-${var.environment}"
+    Name = "${var.project_name}-${var.environment}-logs"
   }
 }
 
@@ -84,14 +51,10 @@ resource "aws_ecs_task_definition" "app" {
       ]
 
       environment = [
-        { name = "SERVER_HOST", value = "0.0.0.0" },
-        { name = "SERVER_PORT", value = tostring(var.container_port) },
-        { name = "AWS_REGION", value = data.aws_region.current.name },
-        { name = "RATE_LIMIT_TABLE", value = var.rate_limit_table },
-        { name = "IDEMPOTENCY_TABLE", value = var.idempotency_table },
-        { name = "KINESIS_STREAM", value = var.kinesis_stream },
-        { name = "KINESIS_ENABLED", value = "true" },
-        { name = "USE_LOCALSTACK", value = "false" }
+        for k, v in var.environment_variables : {
+          name  = k
+          value = v
+        }
       ]
 
       logConfiguration = {
@@ -120,10 +83,6 @@ resource "aws_ecs_task_definition" "app" {
   }
 }
 
-# -----------------------------------------------------------------------------
-# ECS Service
-# -----------------------------------------------------------------------------
-
 resource "aws_ecs_service" "app" {
   name            = "${var.project_name}-${var.environment}"
   cluster         = aws_ecs_cluster.main.id
@@ -143,28 +102,17 @@ resource "aws_ecs_service" "app" {
     container_port   = var.container_port
   }
 
-  deployment_maximum_percent       = 200
-  deployment_minimum_healthy_percent = 100
-
   deployment_circuit_breaker {
     enable   = true
     rollback = true
   }
 
-  depends_on = [aws_lb_listener.http]
+  depends_on = [aws_lb_listener.app]
 
   tags = {
-    Name = "${var.project_name}-${var.environment}"
-  }
-
-  lifecycle {
-    ignore_changes = [desired_count] # Allow auto-scaling to manage this
+    Name = "${var.project_name}-${var.environment}-service"
   }
 }
-
-# -----------------------------------------------------------------------------
-# Application Load Balancer
-# -----------------------------------------------------------------------------
 
 resource "aws_lb" "app" {
   name               = "${var.project_name}-${var.environment}"
@@ -173,10 +121,8 @@ resource "aws_lb" "app" {
   security_groups    = [aws_security_group.alb.id]
   subnets            = var.public_subnet_ids
 
-  enable_deletion_protection = var.environment == "prod" ? true : false
-
   tags = {
-    Name = "${var.project_name}-${var.environment}"
+    Name = "${var.project_name}-${var.environment}-alb"
   }
 }
 
@@ -197,11 +143,11 @@ resource "aws_lb_target_group" "app" {
   }
 
   tags = {
-    Name = "${var.project_name}-${var.environment}"
+    Name = "${var.project_name}-${var.environment}-tg"
   }
 }
 
-resource "aws_lb_listener" "http" {
+resource "aws_lb_listener" "app" {
   load_balancer_arn = aws_lb.app.arn
   port              = "80"
   protocol          = "HTTP"
@@ -218,11 +164,10 @@ resource "aws_lb_listener" "http" {
 
 resource "aws_security_group" "alb" {
   name        = "${var.project_name}-${var.environment}-alb"
-  description = "Security group for ALB"
+  description = "ALB security group"
   vpc_id      = var.vpc_id
 
   ingress {
-    description = "HTTP from anywhere"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
@@ -230,7 +175,6 @@ resource "aws_security_group" "alb" {
   }
 
   ingress {
-    description = "HTTPS from anywhere"
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
@@ -245,17 +189,16 @@ resource "aws_security_group" "alb" {
   }
 
   tags = {
-    Name = "${var.project_name}-${var.environment}-alb"
+    Name = "${var.project_name}-${var.environment}-alb-sg"
   }
 }
 
 resource "aws_security_group" "app" {
   name        = "${var.project_name}-${var.environment}-app"
-  description = "Security group for ECS tasks"
+  description = "Application security group"
   vpc_id      = var.vpc_id
 
   ingress {
-    description     = "Traffic from ALB"
     from_port       = var.container_port
     to_port         = var.container_port
     protocol        = "tcp"
@@ -270,13 +213,9 @@ resource "aws_security_group" "app" {
   }
 
   tags = {
-    Name = "${var.project_name}-${var.environment}-app"
+    Name = "${var.project_name}-${var.environment}-app-sg"
   }
 }
-
-# -----------------------------------------------------------------------------
-# IAM Roles
-# -----------------------------------------------------------------------------
 
 # Execution Role (for ECS agent to pull images, write logs)
 resource "aws_iam_role" "ecs_execution" {
@@ -345,69 +284,59 @@ resource "aws_iam_role_policy" "ecs_task" {
           "dynamodb:Query",
           "dynamodb:DescribeTable"
         ]
-        Resource = [
-          var.rate_limit_table_arn,
-          var.idempotency_table_arn
-        ]
+        Resource = var.dynamodb_table_arns
       },
       {
-        Sid    = "KinesisAccess"
         Effect = "Allow"
         Action = [
           "kinesis:PutRecord",
           "kinesis:PutRecords",
-          "kinesis:DescribeStreamSummary"
+          "kinesis:DescribeStream"
         ]
-        Resource = var.kinesis_stream_arn
+        Resource = [var.kinesis_stream_arn]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret"
+        ]
+        Resource = [var.secrets_manager_arn]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "cloudwatch:PutMetricData"
+        ]
+        Resource = "*"
       }
     ]
   })
 }
 
-# -----------------------------------------------------------------------------
-# Auto Scaling
-# -----------------------------------------------------------------------------
-
 resource "aws_appautoscaling_target" "ecs" {
-  max_capacity       = var.desired_count * 4
-  min_capacity       = var.desired_count
+  count              = var.enable_autoscaling ? 1 : 0
+  max_capacity       = var.max_capacity
+  min_capacity       = var.min_capacity
   resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.app.name}"
   scalable_dimension = "ecs:service:DesiredCount"
   service_namespace  = "ecs"
 }
 
-resource "aws_appautoscaling_policy" "cpu" {
-  name               = "${var.project_name}-${var.environment}-cpu"
+resource "aws_appautoscaling_policy" "cpu_scaling" {
+  count              = var.enable_autoscaling ? 1 : 0
+  name               = "${var.project_name}-${var.environment}-cpu-scaling"
   policy_type        = "TargetTrackingScaling"
-  resource_id        = aws_appautoscaling_target.ecs.resource_id
-  scalable_dimension = aws_appautoscaling_target.ecs.scalable_dimension
-  service_namespace  = aws_appautoscaling_target.ecs.service_namespace
+  resource_id        = aws_appautoscaling_target.ecs[0].resource_id
+  scalable_dimension = aws_appautoscaling_target.ecs[0].scalable_dimension
+  service_namespace  = aws_appautoscaling_target.ecs[0].service_namespace
 
   target_tracking_scaling_policy_configuration {
-    target_value       = 70.0
-    scale_in_cooldown  = 300
-    scale_out_cooldown = 60
-
     predefined_metric_specification {
       predefined_metric_type = "ECSServiceAverageCPUUtilization"
     }
-  }
-}
-
-resource "aws_appautoscaling_policy" "memory" {
-  name               = "${var.project_name}-${var.environment}-memory"
-  policy_type        = "TargetTrackingScaling"
-  resource_id        = aws_appautoscaling_target.ecs.resource_id
-  scalable_dimension = aws_appautoscaling_target.ecs.scalable_dimension
-  service_namespace  = aws_appautoscaling_target.ecs.service_namespace
-
-  target_tracking_scaling_policy_configuration {
-    target_value       = 70.0
+    target_value       = var.scale_up_threshold
     scale_in_cooldown  = 300
     scale_out_cooldown = 60
-
-    predefined_metric_specification {
-      predefined_metric_type = "ECSServiceAverageMemoryUtilization"
-    }
   }
 }

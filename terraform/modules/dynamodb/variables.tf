@@ -1,9 +1,23 @@
 variable "project_name" {
-  description = "Name of the project"
-  type        = string
+  type = string
 }
 
 variable "environment" {
-  description = "Environment name"
-  type        = string
+  type = string
+}
+
+variable "rate_limit_table_config" {
+  type = object({
+    billing_mode   = string
+    read_capacity  = optional(number)
+    write_capacity = optional(number)
+  })
+}
+
+variable "idempotency_table_config" {
+  type = object({
+    billing_mode   = string
+    read_capacity  = optional(number)
+    write_capacity = optional(number)
+  })
 }

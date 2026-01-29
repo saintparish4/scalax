@@ -10,7 +10,7 @@ services:
       - PERSISTENCE=1 
       - DOCKER_HOST=unix:///var/run/docker.sock 
     volumes:
-      - "./localstack-init:/etc/localstack/init/ready.d" 
+      - "./localstack-init:/etc/localstack/init/ready.d"
       - "localstack-data:/var/lib/localstack" 
       - "/var/run/docker.sock:/var/run/docker.sock" 
     healthcheck:
@@ -23,8 +23,6 @@ services:
       - rate-limiter-network 
 
   rate-limiter:
-    profiles:
-      - app
     build:
       context: .
       dockerfile: Dockerfile

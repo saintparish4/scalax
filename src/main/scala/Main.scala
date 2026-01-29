@@ -43,7 +43,7 @@ object Main extends IOApp:
       eventPublisher <- config.kinesis.enabled match
         case true => 
           for
-            kinesisClient <- AwsClients.kinesisClient[IO](config.aws)
+            kinesisClient <- AwsClients.kinesisClient[IO](config.aws, config.dynamodb)
             kinesisPublisher = new KinesisPublisher[IO](kinesisClient, config.kinesis)
           yield kinesisPublisher
         case false => 
@@ -58,7 +58,7 @@ object Main extends IOApp:
         case false =>
           // Use DynamoDB for production
           for
-            dynamoClient <- AwsClients.dynamoDbClient[IO](config.aws)
+            dynamoClient <- AwsClients.dynamoDbClient[IO](config.aws, config.dynamodb)
             store = new DynamoDBRateLimitStore[IO](dynamoClient, config.dynamodb.rateLimitTable)
           yield store
       _ <- Resource.eval(logger.info("Rate limit store initialized"))
@@ -69,7 +69,7 @@ object Main extends IOApp:
           Resource.eval(IdempotencyStore.inMemory[IO])
         case false =>
           for
-            dynamoClient <- AwsClients.dynamoDbClient[IO](config.aws)
+            dynamoClient <- AwsClients.dynamoDbClient[IO](config.aws, config.dynamodb)
             store = new DynamoDBIdempotencyStore[IO](dynamoClient, config.dynamodb.idempotencyTable)
           yield store
       _ <- Resource.eval(logger.info("Idempotency store initialized"))

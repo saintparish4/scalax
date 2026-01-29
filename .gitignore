@@ -81,3 +81,7 @@ tfplan*
 
 # Lock file should be committed
 # !.terraform.lock.hcl
+
+# Documentation for features not yet tested/implemented
+docs/DEPLOYMENT.md
+docs/RUNBOOK.md

@@ -23,8 +23,12 @@ case class AwsConfig(
 ) derives ConfigReader
 
 // DynamoDB table configuration
-case class DynamoDBConfig(rateLimitTable: String, idempotencyTable: String)
-    derives ConfigReader
+case class DynamoDBConfig(
+    rateLimitTable: String, 
+    idempotencyTable: String,
+    connectionTimeout: FiniteDuration = scala.concurrent.duration.Duration(5, "seconds"),
+    requestTimeout: FiniteDuration = scala.concurrent.duration.Duration(10, "seconds")
+) derives ConfigReader
 
 // Kinesis stream configuration
 case class KinesisConfig(

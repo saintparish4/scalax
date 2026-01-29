@@ -1,83 +1,86 @@
 variable "project_name" {
-  description = "Name of the project"
-  type        = string
+  type = string
 }
 
 variable "environment" {
-  description = "Environment name"
-  type        = string
+  type = string
 }
 
 variable "vpc_id" {
-  description = "ID of the VPC"
-  type        = string
-}
-
-variable "public_subnet_ids" {
-  description = "IDs of public subnets (for ALB)"
-  type        = list(string)
+  type = string
 }
 
 variable "private_subnet_ids" {
-  description = "IDs of private subnets (for ECS tasks)"
-  type        = list(string)
+  type = list(string)
+}
+
+variable "public_subnet_ids" {
+  type = list(string)
 }
 
 variable "container_image" {
-  description = "Docker image for the application"
-  type        = string
+  type = string
 }
 
 variable "container_port" {
-  description = "Port the container listens on"
-  type        = number
-  default     = 8080
+  type    = number
+  default = 8080
 }
 
 variable "desired_count" {
-  description = "Desired number of ECS tasks"
-  type        = number
-  default     = 2
+  type    = number
+  default = 2
 }
 
 variable "cpu" {
-  description = "CPU units for ECS task"
-  type        = number
-  default     = 256
+  type    = number
+  default = 256
 }
 
 variable "memory" {
-  description = "Memory (MB) for ECS task"
-  type        = number
-  default     = 512
+  type    = number
+  default = 512
 }
 
-variable "rate_limit_table" {
-  description = "Name of the rate limits DynamoDB table"
-  type        = string
+variable "environment_variables" {
+  type    = map(string)
+  default = {}
 }
 
-variable "rate_limit_table_arn" {
-  description = "ARN of the rate limits DynamoDB table"
-  type        = string
-}
-
-variable "idempotency_table" {
-  description = "Name of the idempotency DynamoDB table"
-  type        = string
-}
-
-variable "idempotency_table_arn" {
-  description = "ARN of the idempotency DynamoDB table"
-  type        = string
-}
-
-variable "kinesis_stream" {
-  description = "Name of the Kinesis stream"
-  type        = string
+variable "dynamodb_table_arns" {
+  type = list(string)
 }
 
 variable "kinesis_stream_arn" {
-  description = "ARN of the Kinesis stream"
-  type        = string
+  type = string
+}
+
+variable "secrets_manager_arn" {
+  type = string
+}
+
+variable "enable_autoscaling" {
+  description = "Enable autoscaling for the ECS service"
+  type        = bool
+  default     = true
+}
+
+variable "min_capacity" {
+  type    = number
+  default = 2
+}
+
+variable "max_capacity" {
+  type    = number
+  default = 10
+}
+
+variable "scale_up_threshold" {
+  type    = number
+  default = 70
+}
+
+variable "scale_down_threshold" {
+  type    = number
+  default = 30
 }

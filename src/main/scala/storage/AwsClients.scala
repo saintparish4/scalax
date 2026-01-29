@@ -1,12 +1,16 @@
 package storage
 
 import java.net.URI
+import java.time.Duration as JavaDuration
+
+import scala.concurrent.duration.FiniteDuration
 
 import cats.effect.{Async, Resource}
-import config.AwsConfig
+import config.{AwsConfig, DynamoDBConfig}
 import software.amazon.awssdk.auth.credentials.{
   AwsBasicCredentials, DefaultCredentialsProvider, StaticCredentialsProvider,
 }
+import software.amazon.awssdk.http.nio.netty.NettyNioAsyncHttpClient
 import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
 import software.amazon.awssdk.services.kinesis.KinesisAsyncClient
@@ -21,27 +25,43 @@ object AwsClients:
   /** Create a DynamoDB async client as a managed Resource
     *
     * The client will be properly closed when the Resource is released, ensuring
-    * no connection leaks
+    * no connection leaks. Configured with proper timeouts and connection pool
+    * settings.
     */
   def dynamoDbClient[F[_]: Async](
-      config: AwsConfig,
+      awsConfig: AwsConfig,
+      dynamoDBConfig: DynamoDBConfig,
   ): Resource[F, DynamoDbAsyncClient] = Resource.make {
     Async[F].delay {
-      val builder = DynamoDbAsyncClient.builder().region(Region.of(config.region))
+      // Configure HTTP client with timeouts and connection pool settings
+      val httpClient = NettyNioAsyncHttpClient.builder().connectionTimeout(
+        JavaDuration.ofMillis(dynamoDBConfig.connectionTimeout.toMillis),
+      ).readTimeout(JavaDuration.ofMillis(dynamoDBConfig.requestTimeout.toMillis))
+        .writeTimeout(JavaDuration.ofMillis(
+          dynamoDBConfig.requestTimeout.toMillis,
+        )).maxConcurrency(50) // Maximum concurrent connections
+        .maxPendingConnectionAcquires(100) // Max pending connection acquisitions
+        .connectionAcquisitionTimeout(JavaDuration.ofSeconds(5))
+        .connectionTimeToLive(JavaDuration.ofSeconds(60)) // Reuse connections for 60s
+        .connectionMaxIdleTime(JavaDuration.ofSeconds(5)) // Close idle connections after 5s
+        .build()
+
+      val builder = DynamoDbAsyncClient.builder()
+        .region(Region.of(awsConfig.region)).httpClient(httpClient)
 
       // Configure credentials based on environment
       val withCredentials =
-        if config.localstack then
+        if awsConfig.localstack then
           builder.credentialsProvider(StaticCredentialsProvider.create(
             AwsBasicCredentials.create("test", "test"),
           ))
         else builder.credentialsProvider(DefaultCredentialsProvider.create())
 
       // Override endpoint for Localstack or custom endpoint
-      val withEndpoint = config.dynamodbEndpoint match
+      val withEndpoint = awsConfig.dynamodbEndpoint match
         case Some(endpoint) => withCredentials
             .endpointOverride(URI.create(endpoint))
-        case None if config.localstack =>
+        case None if awsConfig.localstack =>
           withCredentials.endpointOverride(URI.create("http://localhost:4566"))
         case None => withCredentials
 
@@ -50,24 +70,41 @@ object AwsClients:
   }(client => Async[F].delay(client.close()))
 
   /** Create a Kinesis async client as a managed Resource
+    *
+    * Configured with proper timeouts and connection pool settings.
     */
   def kinesisClient[F[_]: Async](
-      config: AwsConfig,
+      awsConfig: AwsConfig,
+      dynamoDBConfig: DynamoDBConfig, // Reuse DynamoDB timeout config for consistency
   ): Resource[F, KinesisAsyncClient] = Resource.make {
     Async[F].delay {
-      val builder = KinesisAsyncClient.builder().region(Region.of(config.region))
+      // Configure HTTP client with timeouts and connection pool settings
+      val httpClient = NettyNioAsyncHttpClient.builder().connectionTimeout(
+        JavaDuration.ofMillis(dynamoDBConfig.connectionTimeout.toMillis),
+      ).readTimeout(JavaDuration.ofMillis(dynamoDBConfig.requestTimeout.toMillis))
+        .writeTimeout(JavaDuration.ofMillis(
+          dynamoDBConfig.requestTimeout.toMillis,
+        )).maxConcurrency(50) // Maximum concurrent connections
+        .maxPendingConnectionAcquires(100) // Max pending connection acquisitions
+        .connectionAcquisitionTimeout(JavaDuration.ofSeconds(5))
+        .connectionTimeToLive(JavaDuration.ofSeconds(60)) // Reuse connections for 60s
+        .connectionMaxIdleTime(JavaDuration.ofSeconds(5)) // Close idle connections after 5s
+        .build()
+
+      val builder = KinesisAsyncClient.builder()
+        .region(Region.of(awsConfig.region)).httpClient(httpClient)
 
       val withCredentials =
-        if config.localstack then
+        if awsConfig.localstack then
           builder.credentialsProvider(StaticCredentialsProvider.create(
             AwsBasicCredentials.create("test", "test"),
           ))
         else builder.credentialsProvider(DefaultCredentialsProvider.create())
 
-      val withEndpoint = config.kinesisEndpoint match
+      val withEndpoint = awsConfig.kinesisEndpoint match
         case Some(endpoint) => withCredentials
             .endpointOverride(URI.create(endpoint))
-        case None if config.localstack =>
+        case None if awsConfig.localstack =>
           withCredentials.endpointOverride(URI.create("http://localhost:4566"))
         case None => withCredentials
 
